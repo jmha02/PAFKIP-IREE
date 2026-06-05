@@ -12,7 +12,7 @@ sys.path.insert(0, str(THIS_DIR))
 
 from export_lib import export_one
 from model import (
-    AllBNSGDUpdate,
+    AllBNSGDMomentumUpdate,
     collect_bn_affine_params,
     flatten_bn_grads,
     flatten_bn_params,
@@ -28,28 +28,33 @@ def main():
     parser.add_argument("--classes", type=int, default=1000)
     parser.add_argument("--weights", choices=["none", "default"], default="none")
     parser.add_argument("--lr", type=float, default=1.0e-3)
+    parser.add_argument("--sgd-momentum", type=float, default=0.9)
     args = parser.parse_args()
 
     torch.manual_seed(117)
     main_model, ema_model, _ = make_resnet50_tta_models_with_weights(args.classes, args.weights)
     params, names = collect_bn_affine_params(main_model)
-    images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
+    train_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
+    main_filter_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
     with torch.no_grad():
-        ema_logits = ema_model(images)
-    logits = main_model(images)
-    loss = paf_loss(logits, ema_logits)
+        ema_filter_logits = ema_model(main_filter_images)
+        main_filter_logits = main_model(main_filter_images)
+    train_logits = main_model(train_images)
+    loss = paf_loss(train_logits, main_filter_logits, ema_filter_logits)
     loss.backward()
     bn_params = flatten_bn_params(params)
     bn_grads = flatten_bn_grads(params)
+    velocity = torch.zeros_like(bn_params)
     lr = torch.tensor(args.lr, dtype=torch.float32)
+    sgd_momentum = torch.tensor(args.sgd_momentum, dtype=torch.float32)
 
     outputs = export_one(
         args.out_dir,
         "sgd",
-        AllBNSGDUpdate(),
-        (bn_params, bn_grads, lr),
-        ["bn_params", "bn_grads", "lr"],
-        ["new_bn_params"],
+        AllBNSGDMomentumUpdate(),
+        (bn_params, bn_grads, velocity, lr, sgd_momentum),
+        ["bn_params", "bn_grads", "velocity", "lr", "sgd_momentum"],
+        ["new_bn_params", "new_velocity"],
     )
     manifest_path = args.out_dir / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
@@ -65,6 +70,7 @@ def main():
                 "bn_param_count": len(names),
                 "bn_scalar_count": int(bn_params.numel()),
                 "max_param_delta": float(torch.max(torch.abs(outputs[0] - bn_params)).item()),
+                "max_velocity_delta": float(torch.max(torch.abs(outputs[1] - velocity)).item()),
             },
             indent=2,
         )

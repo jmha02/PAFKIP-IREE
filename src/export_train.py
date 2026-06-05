@@ -22,6 +22,7 @@ from model import (
     flatten_bn_params,
     make_resnet50_tta_models_with_weights,
 )
+from paths import repo_relative
 
 
 DTYPE_TO_MLIR = {torch.float32: "f32"}
@@ -57,11 +58,12 @@ def main():
     ref_model, _, _ = make_resnet50_tta_models_with_weights(args.classes, args.weights)
     ref_params, ref_names = collect_bn_affine_params(ref_model)
     flat_bn_params = flatten_bn_params(ref_params).requires_grad_(True)
-    images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
-    ema_logits = torch.randn(1, args.classes, dtype=torch.float32)
+    train_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
+    main_filter_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
+    ema_filter_logits = torch.randn(1, args.classes, dtype=torch.float32)
     lr = torch.tensor(args.lr, dtype=torch.float32)
 
-    ep = export(model, (images, ema_logits, flat_bn_params), strict=False)
+    ep = export(model, (train_images, main_filter_images, ema_filter_logits, flat_bn_params), strict=False)
     fb = _export_forward_backward(ep)
     decomposition_table = get_decompositions([*DEFAULT_DECOMPOSITIONS, torch.ops.aten.as_strided])
     mlir = torch_mlir.fx.export_and_import(
@@ -72,7 +74,7 @@ def main():
     mlir_path = args.out_dir / "train.mlir"
     mlir_path.write_text(str(mlir))
 
-    loss = model(images, ema_logits, flat_bn_params)
+    loss = model(train_images, main_filter_images, ema_filter_logits, flat_bn_params)
     loss.backward()
     flat_grads = flat_bn_params.grad.detach()
     new_bn_params = flat_bn_params.detach() - lr * flat_grads
@@ -80,8 +82,9 @@ def main():
     input_dir = args.out_dir / "inputs"
     golden_dir = args.out_dir / "golden"
     input_tensors = {
-        "images": images,
-        "ema_logits": ema_logits,
+        "train_images": train_images,
+        "main_filter_images": main_filter_images,
+        "ema_filter_logits": ema_filter_logits,
         "flat_bn_params": flat_bn_params.detach(),
     }
     inputs = []
@@ -94,7 +97,7 @@ def main():
                 "shape": list(tensor.shape),
                 "dtype": "f32",
                 "iree": shape_dtype_to_iree(tensor),
-                "file": str(path),
+                "file": repo_relative(path),
             }
         )
 
@@ -111,7 +114,7 @@ def main():
                 "shape": list(tensor.shape),
                 "dtype": "f32",
                 "iree": shape_dtype_to_iree(tensor),
-                "golden": str(path),
+                "golden": repo_relative(path),
             }
         )
 
@@ -121,14 +124,14 @@ def main():
     manifest = {
         "name": "train",
         "function": "main",
-        "mlir": str(mlir_path),
+        "mlir": repo_relative(mlir_path),
         "inputs": inputs,
         "outputs": outputs,
         "bn_param_count": len(ref_names),
         "bn_scalar_count": int(flat_bn_params.numel()),
         "bn_param_names": ref_names,
         "lr": float(args.lr),
-        "golden_new_bn_params": str(update_path),
+        "golden_new_bn_params": repo_relative(update_path),
         "llvmcpu_vector_pproc_strategy": "none",
         "llvmcpu_stack_allocation_limit": 1048576,
     }

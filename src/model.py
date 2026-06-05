@@ -2,6 +2,7 @@ import copy
 import math
 
 import torch
+import torch.nn.functional as F
 
 
 def configure_pafkip_resnet50(model):
@@ -33,20 +34,21 @@ def entropy(logits):
     return -(p * torch.log(p)).sum(dim=1)
 
 
-def paf_loss(main_logits, ema_logits, ent_thr_ratio=0.4, alpha_ood=2.0):
-    num_classes = main_logits.shape[1]
+def paf_loss(train_logits, main_filter_logits, ema_filter_logits, ent_thr_ratio=0.4, alpha_ood=2.0):
+    num_classes = train_logits.shape[1]
     threshold = ent_thr_ratio * math.log(float(num_classes))
-    ent_main = entropy(main_logits)
-    ent_ema = entropy(ema_logits)
-    mask_min = ent_main < threshold
-    mask_max = torch.logical_and(ent_main >= threshold, ent_ema >= threshold)
+    ent_train = entropy(train_logits)
+    ent_main_filter = entropy(main_filter_logits)
+    ent_ema_filter = entropy(ema_filter_logits)
+    mask_min = ent_main_filter < threshold
+    mask_max = torch.logical_and(ent_main_filter >= threshold, ent_ema_filter >= threshold)
     mask_min_f = mask_min.to(torch.float32)
     mask_max_f = mask_max.to(torch.float32)
     count_min = mask_min_f.sum().clamp(min=1.0)
     count_max = mask_max_f.sum().clamp(min=1.0)
-    coeff = torch.exp(-((ent_ema.detach() - threshold).clamp(min=-10.0, max=10.0)))
-    loss_ind = (ent_main * mask_min_f * coeff).sum() / count_min
-    loss_ood = (ent_main * mask_max_f).sum() / count_max
+    coeff = torch.exp(-((ent_ema_filter.detach() - threshold).clamp(min=-10.0, max=10.0)))
+    loss_ind = (ent_train * mask_min_f * coeff).sum() / count_min
+    loss_ood = (ent_train * mask_max_f).sum() / count_max
     return loss_ind - alpha_ood * loss_ood
 
 
@@ -63,6 +65,40 @@ def kip(main_logits, ema_logits, anchor_logits, kip_alpha=0.1):
         + w_ema[:, None] * ema_logits
         + w_anchor[:, None] * anchor_logits
     )
+
+
+def seeded_pafkip_transform_specs(seed: int):
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    specs = []
+    for _ in range(3):
+        top = int(torch.randint(0, 9, (), generator=generator).item())
+        left = int(torch.randint(0, 9, (), generator=generator).item())
+        flip = bool(torch.rand((), generator=generator).item() < 0.5)
+        specs.append((top, left, flip))
+    return specs
+
+
+def fixed_random_crop_hflip(images, top: int, left: int, flip: bool, padding: int = 4):
+    padded = F.pad(images, (padding, padding, padding, padding), mode="constant", value=0.0)
+    cropped = padded[:, :, top : top + images.shape[2], left : left + images.shape[3]]
+    if flip:
+        columns = [cropped[:, :, :, i : i + 1] for i in range(cropped.shape[3] - 1, -1, -1)]
+        cropped = torch.cat(columns, dim=3)
+    return cropped
+
+
+class SeededPAFKIPTTAViews(torch.nn.Module):
+    def __init__(self, seed: int):
+        super().__init__()
+        self.specs = seeded_pafkip_transform_specs(seed)
+
+    def forward(self, images):
+        train = fixed_random_crop_hflip(images, *self.specs[0])
+        main_filter = fixed_random_crop_hflip(images, *self.specs[1])
+        ema_filter = fixed_random_crop_hflip(images, *self.specs[2])
+        anchor = images
+        return train, main_filter, ema_filter, anchor
 
 
 def make_resnet50_tta_models_with_weights(classes=1000, weights_name="none"):
@@ -209,15 +245,18 @@ class FlatBNResNet50PAFLoss(torch.nn.Module):
         x = torch.flatten(x, 1)
         return self.fc(x)
 
-    def forward(self, images, ema_logits, flat_bn_params):
-        return paf_loss(self.forward_logits(images, flat_bn_params), ema_logits)
+    def forward(self, train_images, main_filter_images, ema_filter_logits, flat_bn_params):
+        train_logits = self.forward_logits(train_images, flat_bn_params)
+        main_filter_logits = self.forward_logits(main_filter_images, flat_bn_params).detach()
+        return paf_loss(train_logits, main_filter_logits, ema_filter_logits)
 
 
-class AllBNSGDUpdate(torch.nn.Module):
-    """Flat SGD update for every ResNet50 BatchNorm affine tensor."""
+class AllBNSGDMomentumUpdate(torch.nn.Module):
+    """Flat SGD+momentum update for every ResNet50 BatchNorm affine tensor."""
 
-    def forward(self, bn_params, bn_grads, lr):
-        return bn_params - lr * bn_grads
+    def forward(self, bn_params, bn_grads, velocity, lr, sgd_momentum):
+        new_velocity = sgd_momentum * velocity + bn_grads
+        return bn_params - lr * new_velocity, new_velocity
 
 
 def flatten_bn_params(params):

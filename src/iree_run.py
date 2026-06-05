@@ -6,29 +6,26 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import numpy as np
-
 THIS_DIR = Path(__file__).resolve().parent
 PACKAGE_DIR = THIS_DIR.parent
-WORK_DIR = PACKAGE_DIR.parent
+
+from paths import repo_path
 
 
 def tool_from_path_or_root(tool_name: str, relative_path: str) -> str:
+    submodule_candidate = PACKAGE_DIR / "third_party" / "iree" / "build" / "tools" / tool_name
+    if submodule_candidate.exists():
+        return str(submodule_candidate)
     found = shutil.which(tool_name)
     if found:
         return found
-    root = os.environ.get("FLEXI_ROOT") or os.environ.get("IREE_TOOLCHAIN_ROOT")
-    if root:
-        candidate = Path(root) / relative_path
-        if candidate.exists():
-            return str(candidate)
     raise FileNotFoundError(
-        f"{tool_name} not found in PATH. Source your IREE/Saturn environment "
-        f"or set FLEXI_ROOT/IREE_TOOLCHAIN_ROOT to the checkout containing {relative_path}."
+        f"{tool_name} not found. Build third_party/iree with "
+        f"`tools/setup_from_scratch.sh` or add {tool_name} to PATH."
     )
 
 
-def run(cmd, *, cwd=WORK_DIR, stdout=None):
+def run(cmd, *, cwd=PACKAGE_DIR, stdout=None):
     print("+ " + " ".join(str(c) for c in cmd))
     capture_stdout = stdout == subprocess.PIPE
     result = subprocess.run(cmd, cwd=cwd, stdout=stdout, stderr=subprocess.PIPE, text=True)
@@ -54,7 +51,7 @@ def compile_module(manifest, out_dir: Path, target: str):
     vmfb = out_dir / f"{module_name}_{target}.vmfb"
     flags = [
         iree_compile,
-        manifest["mlir"],
+        str(repo_path(manifest["mlir"])),
         "-o",
         str(vmfb),
         "--mlir-elide-elementsattrs-if-larger=8",
@@ -120,7 +117,7 @@ def compile_module(manifest, out_dir: Path, target: str):
 def invocation_args(manifest, output_dir: Path):
     args = [f"--function={manifest['function']}"]
     for item in manifest["inputs"]:
-        args.append(f"--input={item['iree']}=@{item['file']}")
+        args.append(f"--input={item['iree']}=@{repo_path(item['file'])}")
     output_paths = []
     for item in manifest["outputs"]:
         path = output_dir / f"{item['name']}.bin"
@@ -134,53 +131,18 @@ def run_host(vmfb: Path, manifest, out_dir: Path):
     output_dir = out_dir / "host_outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     args, paths = invocation_args(manifest, output_dir)
+    for path in paths:
+        path.unlink(missing_ok=True)
     run([exe, "--device=local-sync", f"--module={vmfb}", *args])
     return paths
 
 
-def run_spike(vmfb: Path, manifest, out_dir: Path):
-    spike = shutil.which("spike")
-    if not spike:
-        raise FileNotFoundError("spike not found in PATH; source your RISC-V/Saturn environment first")
-    pk_dir = os.environ.get("IREE_RT_PK_DIR")
-    if pk_dir:
-        static_run_module = str(Path(pk_dir) / "tools/static-run-module")
-    else:
-        static_run_module = shutil.which("static-run-module")
-        if not static_run_module:
-            root = os.environ.get("FLEXI_ROOT") or os.environ.get("IREE_TOOLCHAIN_ROOT")
-            if root:
-                static_run_module = str(Path(root) / "runtime/pk/tools/static-run-module")
-    if not static_run_module or not Path(static_run_module).exists():
-        raise FileNotFoundError(
-            "static-run-module not found. Build/source the RISC-V runtime, set "
-            "IREE_RT_PK_DIR, or set FLEXI_ROOT/IREE_TOOLCHAIN_ROOT."
-        )
-
-    output_dir = out_dir / "spike_outputs"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    args, paths = invocation_args(manifest, output_dir)
-    cmd = [
-        spike,
-        "-m4096",
-        (
-            "--isa=rv64gc_zicsr_zifencei_zicntr_zihpm"
-            if manifest.get("riscv_features") == "scalar"
-            else "--isa=rv64gcv_zvl512b_zicsr_zifencei_zicntr_zihpm"
-        ),
-        "pk",
-        static_run_module,
-        f"--module={vmfb}",
-        *args,
-    ]
-    run(cmd, stdout=subprocess.PIPE)
-    return paths
-
-
 def compare_outputs(manifest, actual_paths, label: str):
+    import numpy as np
+
     ok = True
     for item, actual_path in zip(manifest["outputs"], actual_paths):
-        golden = np.fromfile(item["golden"], dtype=np.float32)
+        golden = np.fromfile(repo_path(item["golden"]), dtype=np.float32)
         actual = np.fromfile(actual_path, dtype=np.float32)
         if golden.shape != actual.shape:
             print(f"{label}:{item['name']} shape mismatch {actual.shape} != {golden.shape}")
@@ -209,9 +171,12 @@ def main():
         if not args.skip_run:
             compare_outputs(manifest, run_host(host_vmfb, manifest, args.artifacts), "host")
     if args.target in ("saturn", "both"):
-        saturn_vmfb = compile_module(manifest, args.artifacts, "saturn")
+        compile_module(manifest, args.artifacts, "saturn")
         if not args.skip_run:
-            compare_outputs(manifest, run_spike(saturn_vmfb, manifest, args.artifacts), "spike")
+            raise RuntimeError(
+                "saturn execution is baremetal-only now; use "
+                "`python3 run.py baremetal ...` or `python3 run.py forward-run`."
+            )
 
 
 if __name__ == "__main__":

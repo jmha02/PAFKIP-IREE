@@ -8,6 +8,8 @@ from torch._decomp import get_decompositions
 from torch.export import export
 from torch_mlir.extras.fx_decomp_util import DEFAULT_DECOMPOSITIONS
 
+from paths import repo_relative
+
 
 DTYPE_TO_MLIR = {torch.float32: "f32"}
 
@@ -43,7 +45,7 @@ def export_one(out_dir, name, model, inputs, input_names, output_names, extra_ma
     manifest = {
         "name": name,
         "function": "main",
-        "mlir": str(mlir_path),
+        "mlir": repo_relative(mlir_path),
         "inputs": [],
         "outputs": [],
     }
@@ -58,7 +60,7 @@ def export_one(out_dir, name, model, inputs, input_names, output_names, extra_ma
                 "shape": list(tensor.shape),
                 "dtype": "f32",
                 "iree": shape_dtype_to_iree(tensor),
-                "file": str(path),
+                "file": repo_relative(path),
             }
         )
     for output_name, tensor in zip(output_names, outputs):
@@ -70,7 +72,7 @@ def export_one(out_dir, name, model, inputs, input_names, output_names, extra_ma
                 "shape": list(tensor.shape),
                 "dtype": "f32",
                 "iree": shape_dtype_to_iree(tensor),
-                "golden": str(path),
+                "golden": repo_relative(path),
             }
         )
     (out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))

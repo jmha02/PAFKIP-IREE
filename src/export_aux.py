@@ -12,10 +12,12 @@ sys.path.insert(0, str(THIS_DIR))
 from export_lib import export_one
 from model import (
     FlatBNResNet50PAFLoss,
+    SeededPAFKIPTTAViews,
     collect_bn_affine_params,
     flatten_bn_params,
     kip,
     make_resnet50_tta_models_with_weights,
+    seeded_pafkip_transform_specs,
 )
 
 
@@ -29,8 +31,8 @@ class FlatBNResNet50Logits(torch.nn.Module):
 
 
 class FlatBNEMAUpdate(torch.nn.Module):
-    def forward(self, ema_bn_params, main_bn_params, momentum):
-        return momentum * ema_bn_params + (1.0 - momentum) * main_bn_params
+    def forward(self, ema_bn_params, main_bn_params, ema_decay):
+        return ema_decay * ema_bn_params + (1.0 - ema_decay) * main_bn_params
 
 
 class PAFKIPKIPFinal(torch.nn.Module):
@@ -50,7 +52,8 @@ def main():
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--classes", type=int, default=1000)
     parser.add_argument("--weights", choices=["none", "default"], default="none")
-    parser.add_argument("--momentum", type=float, default=0.999)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument("--transform-seed", type=int, default=91)
     args = parser.parse_args()
 
     torch.manual_seed(91)
@@ -64,7 +67,24 @@ def main():
     logits = torch.randn(1, args.classes, dtype=torch.float32)
     ema_logits = torch.randn(1, args.classes, dtype=torch.float32)
     anchor_logits = torch.randn(1, args.classes, dtype=torch.float32)
-    momentum = torch.tensor(args.momentum, dtype=torch.float32)
+    ema_decay = torch.tensor(args.ema_decay, dtype=torch.float32)
+
+    transform_outputs = export_one(
+        args.out_dir / "tta_views",
+        "tta_views",
+        SeededPAFKIPTTAViews(args.transform_seed),
+        (images,),
+        ["raw_images"],
+        ["train_images", "main_filter_images", "ema_filter_images", "anchor_images"],
+        {
+            "transform": "RandomCrop(224,padding=4)+RandomHorizontalFlip",
+            "transform_seed": int(args.transform_seed),
+            "transform_specs": [
+                {"top": top, "left": left, "flip": flip}
+                for top, left, flip in seeded_pafkip_transform_specs(args.transform_seed)
+            ],
+        },
+    )
 
     export_one(
         args.out_dir / "logits",
@@ -79,8 +99,8 @@ def main():
         args.out_dir / "ema",
         "ema",
         FlatBNEMAUpdate(),
-        (flat_bn_params, shifted_bn_params, momentum),
-        ["ema_bn_params", "main_bn_params", "momentum"],
+        (flat_bn_params, shifted_bn_params, ema_decay),
+        ["ema_bn_params", "main_bn_params", "ema_decay"],
         ["new_ema_bn_params"],
     )
     export_one(
