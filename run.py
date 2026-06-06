@@ -30,9 +30,24 @@ STAGE_ARTIFACTS = {
 }
 
 
+def torch_mlir_package_path() -> Path:
+    return THIS_DIR / "build-torch-mlir" / "tools" / "torch-mlir" / "python_packages" / "torch_mlir"
+
+
+def command_env(extra_env=None):
+    env = os.environ.copy()
+    package_path = torch_mlir_package_path()
+    if package_path.exists():
+        existing = env.get("PYTHONPATH")
+        env["PYTHONPATH"] = str(package_path) if not existing else f"{package_path}:{existing}"
+    if extra_env:
+        env.update(extra_env)
+    return env
+
+
 def run_cmd(cmd: list[str]):
     print("+ " + " ".join(str(c) for c in cmd))
-    subprocess.run(cmd, cwd=THIS_DIR, check=True)
+    subprocess.run(cmd, cwd=THIS_DIR, env=command_env(), check=True)
 
 
 def run_capture(cmd: list[str], *, env=None, allow_timeout: bool = False):
@@ -40,7 +55,7 @@ def run_capture(cmd: list[str], *, env=None, allow_timeout: bool = False):
     result = subprocess.run(
         cmd,
         cwd=THIS_DIR,
-        env=env,
+        env=command_env(env),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -237,10 +252,12 @@ def baremetal_build(args):
     if not artifacts.is_absolute():
         artifacts = THIS_DIR / artifacts
     manifest = load_manifest(artifacts)
-    vmfb = artifacts / f"{manifest.get('name', 'module')}_saturn.vmfb"
+    target = getattr(args, "target", "saturn")
+    vmfb = artifacts / f"{manifest.get('name', 'module')}_{target}.vmfb"
     if not args.reuse_vmfb or not vmfb.exists():
-        vmfb = compile_module(manifest, artifacts, "saturn")
-    default_output = artifacts / f"{manifest.get('name', 'module')}_baremetal.elf"
+        vmfb = compile_module(manifest, artifacts, target)
+    output_suffix = "baremetal" if target == "saturn" else f"{target}_baremetal"
+    default_output = artifacts / f"{manifest.get('name', 'module')}_{output_suffix}.elf"
     output = args.output or default_output
     if not output.is_absolute():
         output = THIS_DIR / output
@@ -283,7 +300,9 @@ def baremetal_run(args):
     if not artifacts.is_absolute():
         artifacts = THIS_DIR / artifacts
     manifest = load_manifest(artifacts)
-    default_elf = artifacts / f"{manifest.get('name', 'module')}_baremetal.elf"
+    target = getattr(args, "target", "saturn")
+    output_suffix = "baremetal" if target == "saturn" else f"{target}_baremetal"
+    default_elf = artifacts / f"{manifest.get('name', 'module')}_{output_suffix}.elf"
     elf = args.elf or default_elf
     if not elf.is_absolute():
         elf = THIS_DIR / elf
@@ -357,6 +376,8 @@ def verify_spike(args):
         sys.executable,
         str(THIS_DIR / "tools" / "verify_spike_stage.py"),
         str(stage_dir),
+        "--target",
+        args.target,
         "--runner",
         args.runner,
         "--print-limit",
@@ -396,6 +417,7 @@ def add_common_build_args(parser):
 
 
 def add_baremetal_build_args(parser):
+    parser.add_argument("--target", choices=["saturn", "flexinpu"], default="saturn")
     parser.add_argument("--runtime-root", type=Path)
     parser.add_argument("--toolchain-root", type=Path)
     parser.add_argument("--march", default="rv64gcv_zvl512b")
@@ -424,7 +446,7 @@ def build_parser():
     p.set_defaults(func=prepare)
 
     p = sub.add_parser("compile", help="compile the full loop VMFB")
-    p.add_argument("--target", choices=["host", "saturn", "both"], default="host")
+    p.add_argument("--target", choices=["host", "saturn", "flexinpu", "both"], default="host")
     p.set_defaults(func=compile_target)
 
     p = sub.add_parser("run", help="compile and run the full loop on the host")
@@ -444,7 +466,7 @@ def build_parser():
     p = sub.add_parser("verify-host", help="verify decomposed stages with host IREE")
     p.add_argument("--only", nargs="+", choices=sorted(k for k in STAGE_ARTIFACTS if k != "full"))
     p.add_argument("--skip-heavy", action="store_true", help="skip ResNet logits/train stages")
-    p.add_argument("--target", choices=["host", "saturn", "both"], default="host")
+    p.add_argument("--target", choices=["host", "saturn", "flexinpu", "both"], default="host")
     p.add_argument("--reuse-vmfb", action="store_true")
     p.add_argument("--compile-only", action="store_true")
     p.add_argument("--atol", type=float, default=5.0e-4)
@@ -455,6 +477,7 @@ def build_parser():
 
     p = sub.add_parser("verify-spike", help="verify one stage on pk-free Spike baremetal")
     p.add_argument("stage", choices=sorted(k for k in STAGE_ARTIFACTS if k != "full"))
+    p.add_argument("--target", choices=["saturn", "flexinpu"], default="saturn")
     p.add_argument("--runner", choices=["tooling", "direct"], default="direct")
     p.add_argument("--print-limit", type=int, default=0)
     p.add_argument("--timeout", type=int, default=0)

@@ -77,23 +77,27 @@ def compile_module(manifest, out_dir: Path, target: str):
                 "--iree-llvmcpu-stack-allocation-limit="
                 + str(manifest["llvmcpu_stack_allocation_limit"])
             )
-    elif target == "saturn":
+    elif target in ("saturn", "flexinpu"):
         scalar_riscv = manifest.get("riscv_features") == "scalar"
+        riscv_features = (
+            "+m,+f,+d,+a"
+            if scalar_riscv
+            else "+m,+f,+d,+a,+v,+zvl512b"
+        )
+        if target == "flexinpu":
+            riscv_features += ",+flexinpu"
+            flags.append("--iree-global-opt-use-im2col-for-convs=true")
         flags.extend(
             [
                 "--iree-llvmcpu-target-triple=riscv64-unknown-eabi-elf",
                 "--iree-llvmcpu-target-cpu=generic-rv64",
                 "--iree-llvmcpu-target-abi=lp64d",
                 "--iree-llvmcpu-link-embedded",
-                (
-                    "--iree-llvmcpu-target-cpu-features=+m,+f,+d,+a"
-                    if scalar_riscv
-                    else "--iree-llvmcpu-target-cpu-features=+m,+f,+d,+a,+v,+zvl512b"
-                ),
+                f"--iree-llvmcpu-target-cpu-features={riscv_features}",
                 "--riscv-insert-vsetvli-whole-vector-register-move-valid-vtype=false",
                 "--iree-llvmcpu-fail-on-large-vector=false",
                 "--iree-opt-data-tiling=false",
-                f"--iree-hal-dump-executable-intermediates-to={out_dir / 'saturn_intms'}",
+                f"--iree-hal-dump-executable-intermediates-to={out_dir / f'{target}_intms'}",
             ]
         )
         if not scalar_riscv:
@@ -161,7 +165,7 @@ def compare_outputs(manifest, actual_paths, label: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifacts", type=Path, default=THIS_DIR / "artifacts")
-    parser.add_argument("--target", choices=["host", "saturn", "both"], default="both")
+    parser.add_argument("--target", choices=["host", "saturn", "flexinpu", "both"], default="both")
     parser.add_argument("--skip-run", action="store_true")
     args = parser.parse_args()
 
@@ -172,11 +176,13 @@ def main():
             compare_outputs(manifest, run_host(host_vmfb, manifest, args.artifacts), "host")
     if args.target in ("saturn", "both"):
         compile_module(manifest, args.artifacts, "saturn")
-        if not args.skip_run:
-            raise RuntimeError(
-                "saturn execution is baremetal-only now; use "
-                "`python3 run.py baremetal ...` or `python3 run.py forward-run`."
-            )
+    if args.target == "flexinpu":
+        compile_module(manifest, args.artifacts, "flexinpu")
+    if args.target in ("saturn", "flexinpu", "both") and not args.skip_run:
+        raise RuntimeError(
+            "RISC-V execution is baremetal-only now; use "
+            "`python3 run.py baremetal ...` or `python3 run.py forward-run`."
+        )
 
 
 if __name__ == "__main__":

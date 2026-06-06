@@ -6,6 +6,11 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+from torch_mlir_bootstrap import add_torch_mlir_build_path
+
+add_torch_mlir_build_path()
+
 import torch_mlir.fx
 from torch._decomp import get_decompositions
 from torch.export import export

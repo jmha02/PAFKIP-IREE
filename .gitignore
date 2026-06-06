@@ -1,4 +1,5 @@
 artifact_*/
+build-torch-mlir/
 __pycache__/
 **/__pycache__/
 *.pyc
