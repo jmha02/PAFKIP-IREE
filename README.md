@@ -1,6 +1,6 @@
 # PAFKIP-IREE
 
-RISCV+Saturn on June 6th
+Current target: RISC-V/Saturn only.
 
 ## Setup
 
@@ -34,7 +34,6 @@ python3 run.py prepare --weights default --force
 ```bash
 python3 run.py verify-host --skip-heavy --reuse-vmfb
 python3 run.py run --target host
-python3 tools/verify_full_host.py
 ```
 
 ## RISC-V/Saturn Compile
