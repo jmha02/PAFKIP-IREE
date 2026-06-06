@@ -1,5 +1,7 @@
 # PAFKIP-IREE
 
+RISCV+Saturn on June 6th
+
 ## Setup
 
 ```bash
@@ -39,15 +41,14 @@ python3 tools/verify_full_host.py
 
 ```bash
 python3 run.py compile --target saturn
-python3 run.py compile --target flexinpu # TODO
 ```
 
 ## ResNet50 Forward
 
 ```bash
-python3 run.py verify-host --only logits --target flexinpu --compile-only --reuse-vmfb
-python3 run.py forward-build --target flexinpu
-python3 run.py forward-run --target flexinpu --reuse-vmfb
+python3 run.py verify-host --only logits --target saturn --compile-only --reuse-vmfb
+python3 run.py forward-build --target saturn
+python3 run.py forward-run --target saturn --reuse-vmfb
 ```
 
 ## Stage Spike Checks
@@ -63,5 +64,5 @@ python3 run.py verify-spike logits --reuse-vmfb --atol 1e-2 --rtol 1e-2 # 약간
 ## Full Baremetal Build
 
 ```bash
-python3 run.py baremetal build --target flexinpu --artifacts artifact_full --reuse-vmfb
+python3 run.py baremetal build --target saturn --artifacts artifact_full --reuse-vmfb
 ```
