@@ -289,6 +289,8 @@ def baremetal_build(args):
         args.runner,
         *_baremetal_input_args(manifest),
     ]
+    if getattr(args, "stack_shift", None) is not None:
+        cmd.extend(["--stack-shift", str(args.stack_shift)])
     if args.optimize_size:
         cmd.append("--optimize-size")
     run_cmd(cmd)
@@ -426,6 +428,11 @@ def add_baremetal_build_args(parser):
     parser.add_argument("--output-print-limit", type=int, default=16)
     parser.add_argument("--runner", choices=["direct", "tooling"], default="direct")
     parser.add_argument("--optimize-size", action="store_true")
+    parser.add_argument(
+        "--stack-shift",
+        type=int,
+        help="Override baremetal CRT stack/heap window size as log2(bytes).",
+    ) # Verilator 상에서 DRAM 크기 조정 필요할 때
 
 
 def add_baremetal_run_args(parser):
