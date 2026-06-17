@@ -49,6 +49,7 @@ def compile_module(manifest, out_dir: Path, target: str):
     iree_compile = tool_from_path_or_root("iree-compile", "iree-build/tools/iree-compile")
     module_name = manifest.get("name", "pafkip_train_step")
     vmfb = out_dir / f"{module_name}_{target}.vmfb"
+    input_type = manifest.get("input_type", "torch")
     flags = [
         iree_compile,
         str(repo_path(manifest["mlir"])),
@@ -56,8 +57,9 @@ def compile_module(manifest, out_dir: Path, target: str):
         str(vmfb),
         "--mlir-elide-elementsattrs-if-larger=8",
         "--iree-hal-target-backends=llvm-cpu",
-        "--iree-input-type=torch",
     ]
+    if input_type != "none":
+        flags.append(f"--iree-input-type={input_type}")
     if target == "host":
         flags.extend(
             [
@@ -77,16 +79,19 @@ def compile_module(manifest, out_dir: Path, target: str):
                 "--iree-llvmcpu-stack-allocation-limit="
                 + str(manifest["llvmcpu_stack_allocation_limit"])
             )
-    elif target in ("saturn", "flexinpu"):
+    elif target in ("saturn", "flexinpu", "flexinpu_int4"):
         scalar_riscv = manifest.get("riscv_features") == "scalar"
         riscv_features = (
             "+m,+f,+d,+a"
             if scalar_riscv
             else "+m,+f,+d,+a,+v,+zvl512b"
         )
-        if target == "flexinpu":
-            riscv_features += ",+flexinpu"
+        if target in ("saturn", "flexinpu", "flexinpu_int4"):
             flags.append("--iree-global-opt-use-im2col-for-convs=true")
+        if target in ("flexinpu", "flexinpu_int4"):
+            riscv_features += ",+flexinpu"
+        if target == "flexinpu_int4" or manifest.get("flexinpu_npu_dtype") == "int4":
+            riscv_features += ",+flexinpu-int4"
         flags.extend(
             [
                 "--iree-llvmcpu-target-triple=riscv64-unknown-eabi-elf",
@@ -118,6 +123,14 @@ def compile_module(manifest, out_dir: Path, target: str):
     return vmfb
 
 
+def spike_extension_for_target(target: str, manifest: dict | None = None) -> str | None:
+    if target in ("flexinpu", "flexinpu_int4"):
+        return "flexi"
+    if manifest and manifest.get("spike_extension"):
+        return manifest["spike_extension"]
+    return None
+
+
 def invocation_args(manifest, output_dir: Path):
     args = [f"--function={manifest['function']}"]
     for item in manifest["inputs"]:
@@ -147,13 +160,21 @@ def compare_outputs(manifest, actual_paths, label: str):
     ok = True
     for item, actual_path in zip(manifest["outputs"], actual_paths):
         golden = np.fromfile(repo_path(item["golden"]), dtype=np.float32)
-        actual = np.fromfile(actual_path, dtype=np.float32)
+        if item.get("dtype") == "f32":
+            actual = np.fromfile(actual_path, dtype=np.float32)
+        else:
+            actual = np.fromfile(actual_path, dtype=np.int8).astype(np.float32)
         if golden.shape != actual.shape:
             print(f"{label}:{item['name']} shape mismatch {actual.shape} != {golden.shape}")
             ok = False
             continue
-        atol = 5.0e-4
-        rtol = 5.0e-4
+        atol = float(manifest.get("compare_atol", 5.0e-4))
+        rtol = float(manifest.get("compare_rtol", 5.0e-4))
+        compare_mode = item.get("compare_as")
+        if compare_mode == "dequantized_f32":
+            quant = manifest.get("quantization", {})
+            scale = float(quant.get("scale", 1.0))
+            actual = actual.astype(np.float32) * scale
         close = np.allclose(actual, golden, atol=atol, rtol=rtol)
         max_abs = float(np.max(np.abs(actual - golden))) if golden.size else 0.0
         print(f"{label}:{item['name']} close={close} max_abs={max_abs:.6g}")
@@ -165,7 +186,7 @@ def compare_outputs(manifest, actual_paths, label: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifacts", type=Path, default=THIS_DIR / "artifacts")
-    parser.add_argument("--target", choices=["host", "saturn", "flexinpu", "both"], default="both")
+    parser.add_argument("--target", choices=["host", "saturn", "flexinpu", "flexinpu_int4", "both"], default="both")
     parser.add_argument("--skip-run", action="store_true")
     args = parser.parse_args()
 
@@ -178,7 +199,9 @@ def main():
         compile_module(manifest, args.artifacts, "saturn")
     if args.target == "flexinpu":
         compile_module(manifest, args.artifacts, "flexinpu")
-    if args.target in ("saturn", "flexinpu", "both") and not args.skip_run:
+    if args.target == "flexinpu_int4":
+        compile_module(manifest, args.artifacts, "flexinpu_int4")
+    if args.target in ("saturn", "flexinpu", "flexinpu_int4", "both") and not args.skip_run:
         raise RuntimeError(
             "RISC-V execution is baremetal-only now; use "
             "`python3 run.py baremetal ...` or `python3 run.py forward-run`."
