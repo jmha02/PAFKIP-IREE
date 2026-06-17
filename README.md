@@ -34,9 +34,11 @@ environment for the baremetal ELF path.
 ## Generate Artifacts
 
 Run this first. It exports the decomposed stages and the composed full loop.
+The default path uses fixed random inputs and fixed TTA transforms, so host,
+Spike, and FireSim runs are comparable.
 
 ```bash
-python3 run.py prepare
+python3 run.py prepare --force
 ```
 
 If you want torchvision's pretrained ResNet50 weights:
@@ -109,37 +111,113 @@ python3 run.py forward-run --target saturn
 
 ## Full TTA Step
 
-Compile the composed full loop:
+This is the main path used for the Saturn/FireSim run. It performs one
+PAFKIP-style TTA step for ResNet50: TTA views, ResNet logits, BN-gradient
+training step, SGD momentum update, EMA update, and KIP final prediction.
 
-```bash
-python3 run.py compile --target saturn
-```
-
-Build the full baremetal ELF:
-
-```bash
-python3 run.py baremetal build \
-  --target saturn \
-  --artifacts artifact_full \
-  --reuse-vmfb
-```
-
-Run the full loop on the host:
+First check the full loop on the host:
 
 ```bash
 python3 run.py run --target host
 ```
 
-Run the full loop on RISCV+Saturn Spike:
+Expected output includes a JSON summary similar to:
+
+```text
+"steps": 1
+"loss": -13.461...
+"energy": 7.079...
+"changed_main_bn_scalars": ...
+"velocity_formula_max_abs": 0.0
+"main_update_formula_max_abs": 0.0
+"ema_formula_max_abs": 0.0
+```
+
+Compile the composed loop for RISC-V/Saturn:
+
+```bash
+python3 run.py compile --target saturn
+```
+
+Build the full baremetal ELF. The `--output-print-limit 1` option keeps UART
+output short by printing one value per output tensor.
+
+```bash
+python3 run.py baremetal build \
+  --target saturn \
+  --artifacts artifact_full \
+  --reuse-vmfb \
+  --stack-shift 30 \
+  --output artifact_full/full_baremetal_saturn_print1_stack30.elf \
+  --output-print-limit 1
+```
+
+Run the same ELF on Spike:
 
 ```bash
 python3 run.py baremetal run \
   --target saturn \
   --artifacts artifact_full \
+  --elf artifact_full/full_baremetal_saturn_print1_stack30.elf \
   --reuse-vmfb
 ```
 
+Or call Spike directly:
+
+```bash
+spike -m4096 \
+  --isa=rv64gcv_zvl512b_zicsr_zifencei_zicntr_zihpm \
+  artifact_full/full_baremetal_saturn_print1_stack30.elf
+```
+
+A successful run ends with:
+
+```text
+[IREE][marker] invoke.end
+[IREE][marker] run.end
+[baremetal] tohost_exit code=0x0000000000000000
+Simulation complete.
+*** PASSED ***
+```
+
 This is the full baremetal path. It can take much longer than the small stage checks.
+
+## FireSim Run
+
+FireSim uses the same baremetal ELF. Copy it into the workload bootbinary slot:
+
+```bash
+cp artifact_full/full_baremetal_saturn_print1_stack30.elf \
+  ~/chipyard/sims/firesim/deploy/workloads/st00ne-2/ffn2_to_last.elf
+```
+
+On the FireSim manager:
+
+```bash
+cd ~/chipyard/sims/firesim
+
+./deploy/firesim \
+  -c config_runtime_pafkip_resnet_logits_st00ne2.yaml \
+  -a ~/chipyard/sims/firesim-staging/sample_config_hwdb_f2_saturn_gemmini.yaml \
+  -r ~/chipyard/sims/firesim-staging/sample_config_build_recipes_f2_saturn_gemmini.yaml \
+  infrasetup
+
+./deploy/firesim \
+  -c config_runtime_pafkip_resnet_logits_st00ne2.yaml \
+  -a ~/chipyard/sims/firesim-staging/sample_config_hwdb_f2_saturn_gemmini.yaml \
+  -r ~/chipyard/sims/firesim-staging/sample_config_build_recipes_f2_saturn_gemmini.yaml \
+  runworkload
+```
+
+The result directory is printed by FireSim. Check the collected UART log:
+
+```bash
+grep -a "\[IREE\]\|\*\*\* PASSED \*\*\*" \
+  deploy/results-workload/<run-dir>/st00ne-20/uartlog | tail -80
+```
+
+The full train run we tested completed successfully on FireSim in about
+3.5 hours. The exact time depends on the FPGA configuration and UART verbosity.
 
 ## Baremetal Simulator Notes
 
