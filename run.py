@@ -192,6 +192,8 @@ def prepare_flexi_smoke(args):
             str(args.n),
             "--k",
             str(args.k),
+            "--init-value",
+            str(args.init_value),
         ]
     )
     print(out_dir)
@@ -662,6 +664,7 @@ def build_parser():
     p.add_argument("--m", type=int, default=32)
     p.add_argument("--n", type=int, default=32)
     p.add_argument("--k", type=int, default=32)
+    p.add_argument("--init-value", type=float, default=0.0)
     p.add_argument("--out-dir", type=Path)
     p.set_defaults(func=prepare_flexi_smoke)
 
