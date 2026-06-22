@@ -30,7 +30,7 @@ def collect_bn_affine_params(model):
 
 
 def entropy(logits):
-    p = torch.softmax(logits, dim=1).clamp(min=1.0e-6)
+    p = torch.softmax(logits.to(torch.float32), dim=1).clamp(min=1.0e-6)
     return -(p * torch.log(p)).sum(dim=1)
 
 
@@ -53,18 +53,22 @@ def paf_loss(train_logits, main_filter_logits, ema_filter_logits, ent_thr_ratio=
 
 
 def kip(main_logits, ema_logits, anchor_logits, kip_alpha=0.1):
-    conf_main = torch.softmax(main_logits, dim=1).max(dim=1).values
-    conf_ema = torch.softmax(ema_logits, dim=1).max(dim=1).values
-    conf_anchor = torch.softmax(anchor_logits, dim=1).max(dim=1).values
+    output_dtype = main_logits.dtype
+    main_f32 = main_logits.to(torch.float32)
+    ema_f32 = ema_logits.to(torch.float32)
+    anchor_f32 = anchor_logits.to(torch.float32)
+    conf_main = torch.softmax(main_f32, dim=1).max(dim=1).values
+    conf_ema = torch.softmax(ema_f32, dim=1).max(dim=1).values
+    conf_anchor = torch.softmax(anchor_f32, dim=1).max(dim=1).values
     conf_mean = (conf_main + conf_ema + conf_anchor) / 3.0
     w_main = (1.0 / 3.0) + kip_alpha * (conf_main - conf_mean)
     w_ema = (1.0 / 3.0) + kip_alpha * (conf_ema - conf_mean)
     w_anchor = (1.0 / 3.0) + kip_alpha * (conf_anchor - conf_mean)
     return (
-        w_main[:, None] * main_logits
-        + w_ema[:, None] * ema_logits
-        + w_anchor[:, None] * anchor_logits
-    )
+        w_main[:, None] * main_f32
+        + w_ema[:, None] * ema_f32
+        + w_anchor[:, None] * anchor_f32
+    ).to(output_dtype)
 
 
 def seeded_pafkip_transform_specs(seed: int):
@@ -120,6 +124,42 @@ def make_resnet50_tta_models_with_weights(classes=1000, weights_name="none"):
     return main, ema, anchor
 
 
+def _npu_torch_dtype(npu_dtype: str):
+    if npu_dtype == "f16":
+        return torch.float16
+    if npu_dtype == "bf16":
+        return torch.bfloat16
+    return None
+
+
+def _conv2d_npu_island(x, conv, npu_dtype: str):
+    island_dtype = _npu_torch_dtype(npu_dtype)
+    if island_dtype is None:
+        return conv(x)
+    y = F.conv2d(
+        x.to(island_dtype),
+        conv.weight.to(island_dtype),
+        None if conv.bias is None else conv.bias.to(island_dtype),
+        conv.stride,
+        conv.padding,
+        conv.dilation,
+        conv.groups,
+    )
+    return y.to(torch.float32)
+
+
+def _linear_npu_island(x, linear, npu_dtype: str):
+    island_dtype = _npu_torch_dtype(npu_dtype)
+    if island_dtype is None:
+        return linear(x)
+    y = F.linear(
+        x.to(island_dtype),
+        linear.weight.to(island_dtype),
+        None if linear.bias is None else linear.bias.to(island_dtype),
+    )
+    return y.to(torch.float32)
+
+
 class FlatBatchNorm2d(torch.nn.Module):
     def __init__(self, source_bn, weight_offset, bias_offset):
         super().__init__()
@@ -135,15 +175,20 @@ class FlatBatchNorm2d(torch.nn.Module):
         bias = flat_bn_params[
             self.bias_offset : self.bias_offset + self.num_features
         ].reshape(1, self.num_features, 1, 1)
-        mean = x.mean(dim=(0, 2, 3), keepdim=True)
-        centered = x - mean
+        compute_dtype = torch.float32
+        x_stats = x.to(compute_dtype)
+        weight = weight.to(compute_dtype)
+        bias = bias.to(compute_dtype)
+        mean = x_stats.mean(dim=(0, 2, 3), keepdim=True)
+        centered = x_stats - mean
         var = (centered * centered).mean(dim=(0, 2, 3), keepdim=True)
-        return centered * torch.rsqrt(var + self.eps) * weight + bias
+        return (centered * torch.rsqrt(var + self.eps) * weight + bias).to(x.dtype)
 
 
 class FlatBNBottleneck(torch.nn.Module):
-    def __init__(self, source_block, offset_by_name, prefix):
+    def __init__(self, source_block, offset_by_name, prefix, npu_dtype="f32"):
         super().__init__()
+        self.npu_dtype = npu_dtype
         self.conv1 = source_block.conv1
         self.bn1 = FlatBatchNorm2d(
             source_block.bn1,
@@ -175,19 +220,19 @@ class FlatBNBottleneck(torch.nn.Module):
     def forward(self, x, flat_bn_params):
         identity = x
 
-        out = self.conv1(x)
+        out = _conv2d_npu_island(x, self.conv1, self.npu_dtype)
         out = self.bn1(out, flat_bn_params)
         out = torch.relu(out)
 
-        out = self.conv2(out)
+        out = _conv2d_npu_island(out, self.conv2, self.npu_dtype)
         out = self.bn2(out, flat_bn_params)
         out = torch.relu(out)
 
-        out = self.conv3(out)
+        out = _conv2d_npu_island(out, self.conv3, self.npu_dtype)
         out = self.bn3(out, flat_bn_params)
 
         if self.downsample_conv is not None:
-            identity = self.downsample_conv(x)
+            identity = _conv2d_npu_island(x, self.downsample_conv, self.npu_dtype)
             identity = self.downsample_bn(identity, flat_bn_params)
 
         out = out + identity
@@ -195,8 +240,11 @@ class FlatBNBottleneck(torch.nn.Module):
 
 
 class FlatBNResNet50PAFLoss(torch.nn.Module):
-    def __init__(self, classes=1000, weights_name="none"):
+    def __init__(self, classes=1000, weights_name="none", npu_dtype="f32"):
         super().__init__()
+        if npu_dtype not in ("f32", "f16", "bf16"):
+            raise ValueError(f"unsupported npu_dtype: {npu_dtype}")
+        self.npu_dtype = npu_dtype
         source, _, _ = make_resnet50_tta_models_with_weights(classes, weights_name)
         params, names = collect_bn_affine_params(source)
         self.bn_param_names = names
@@ -211,25 +259,25 @@ class FlatBNResNet50PAFLoss(torch.nn.Module):
         self.conv1 = source.conv1
         self.bn1 = FlatBatchNorm2d(source.bn1, offsets["bn1.weight"], offsets["bn1.bias"])
         self.maxpool = source.maxpool
-        self.layer1 = self._make_layer(source.layer1, offsets, "layer1")
-        self.layer2 = self._make_layer(source.layer2, offsets, "layer2")
-        self.layer3 = self._make_layer(source.layer3, offsets, "layer3")
-        self.layer4 = self._make_layer(source.layer4, offsets, "layer4")
+        self.layer1 = self._make_layer(source.layer1, offsets, "layer1", npu_dtype)
+        self.layer2 = self._make_layer(source.layer2, offsets, "layer2", npu_dtype)
+        self.layer3 = self._make_layer(source.layer3, offsets, "layer3", npu_dtype)
+        self.layer4 = self._make_layer(source.layer4, offsets, "layer4", npu_dtype)
         self.avgpool = source.avgpool
         self.fc = source.fc
         self.requires_grad_(False)
 
     @staticmethod
-    def _make_layer(source_layer, offsets, prefix):
+    def _make_layer(source_layer, offsets, prefix, npu_dtype):
         return torch.nn.ModuleList(
             [
-                FlatBNBottleneck(block, offsets, f"{prefix}.{index}")
+                FlatBNBottleneck(block, offsets, f"{prefix}.{index}", npu_dtype)
                 for index, block in enumerate(source_layer)
             ]
         )
 
     def forward_logits(self, images, flat_bn_params):
-        x = self.conv1(images)
+        x = _conv2d_npu_island(images, self.conv1, self.npu_dtype)
         x = self.bn1(x, flat_bn_params)
         x = torch.relu(x)
         x = self.maxpool(x)
@@ -243,7 +291,7 @@ class FlatBNResNet50PAFLoss(torch.nn.Module):
             x = block(x, flat_bn_params)
         x = self.avgpool(x)
         x = torch.flatten(x, 1)
-        return self.fc(x)
+        return _linear_npu_island(x, self.fc, self.npu_dtype)
 
     def forward(self, train_images, main_filter_images, ema_filter_logits, flat_bn_params):
         train_logits = self.forward_logits(train_images, flat_bn_params)

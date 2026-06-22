@@ -30,7 +30,15 @@ from model import (
 from paths import repo_relative
 
 
-DTYPE_TO_MLIR = {torch.float32: "f32"}
+DTYPE_TO_MLIR = {
+    torch.float16: "f16",
+    torch.float32: "f32",
+}
+
+TORCH_TO_NUMPY = {
+    torch.float16: np.float16,
+    torch.float32: np.float32,
+}
 
 
 def shape_dtype_to_iree(tensor: torch.Tensor) -> str:
@@ -40,7 +48,7 @@ def shape_dtype_to_iree(tensor: torch.Tensor) -> str:
 
 def write_bin(path: Path, tensor: torch.Tensor):
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.asarray(tensor.detach().cpu().numpy()).astype(np.float32).tofile(path)
+    np.asarray(tensor.detach().cpu().numpy()).astype(TORCH_TO_NUMPY[tensor.dtype]).tofile(path)
 
 
 def main():
@@ -54,19 +62,22 @@ def main():
     parser.add_argument("--classes", type=int, default=1000)
     parser.add_argument("--weights", choices=["none", "default"], default="none")
     parser.add_argument("--lr", type=float, default=1.0e-3)
+    parser.add_argument("--dtype", choices=["f32", "f16"], default="f32")
+    parser.add_argument("--npu-dtype", choices=["f32", "f16", "bf16"], default="f32")
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(91)
+    dtype = torch.float16 if args.dtype == "f16" else torch.float32
 
-    model = FlatBNResNet50PAFLoss(args.classes, args.weights)
+    model = FlatBNResNet50PAFLoss(args.classes, args.weights, args.npu_dtype).to(dtype)
     ref_model, _, _ = make_resnet50_tta_models_with_weights(args.classes, args.weights)
     ref_params, ref_names = collect_bn_affine_params(ref_model)
-    flat_bn_params = flatten_bn_params(ref_params).requires_grad_(True)
-    train_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
-    main_filter_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
-    ema_filter_logits = torch.randn(1, args.classes, dtype=torch.float32)
-    lr = torch.tensor(args.lr, dtype=torch.float32)
+    flat_bn_params = flatten_bn_params(ref_params).to(dtype).requires_grad_(True)
+    train_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=dtype)
+    main_filter_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=dtype)
+    ema_filter_logits = torch.randn(1, args.classes, dtype=dtype)
+    lr = torch.tensor(args.lr, dtype=dtype)
 
     ep = export(model, (train_images, main_filter_images, ema_filter_logits, flat_bn_params), strict=False)
     fb = _export_forward_backward(ep)
@@ -100,7 +111,7 @@ def main():
             {
                 "name": name,
                 "shape": list(tensor.shape),
-                "dtype": "f32",
+                "dtype": DTYPE_TO_MLIR[tensor.dtype],
                 "iree": shape_dtype_to_iree(tensor),
                 "file": repo_relative(path),
             }
@@ -117,7 +128,7 @@ def main():
             {
                 "name": name,
                 "shape": list(tensor.shape),
-                "dtype": "f32",
+                "dtype": DTYPE_TO_MLIR[tensor.dtype],
                 "iree": shape_dtype_to_iree(tensor),
                 "golden": repo_relative(path),
             }
@@ -139,6 +150,7 @@ def main():
         "golden_new_bn_params": repo_relative(update_path),
         "llvmcpu_vector_pproc_strategy": "none",
         "llvmcpu_stack_allocation_limit": 1048576,
+        "npu_dtype": args.npu_dtype,
     }
     (args.out_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(mlir_path)

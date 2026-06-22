@@ -16,7 +16,20 @@ from torch_mlir.extras.fx_decomp_util import DEFAULT_DECOMPOSITIONS
 from paths import repo_relative
 
 
-DTYPE_TO_MLIR = {torch.float32: "f32"}
+DTYPE_TO_MLIR = {
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+    torch.float32: "f32",
+}
+
+TORCH_TO_NUMPY = {
+    torch.float16: np.float16,
+    torch.float32: np.float32,
+}
+
+
+def manifest_dtype(tensor: torch.Tensor) -> str:
+    return DTYPE_TO_MLIR[tensor.dtype]
 
 
 def shape_dtype_to_iree(tensor: torch.Tensor) -> str:
@@ -26,7 +39,11 @@ def shape_dtype_to_iree(tensor: torch.Tensor) -> str:
 
 def write_bin(path: Path, tensor: torch.Tensor):
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.asarray(tensor.detach().cpu().numpy()).astype(np.float32).tofile(path)
+    if tensor.dtype == torch.bfloat16:
+        array = tensor.detach().cpu().to(torch.float32).numpy().astype(np.float32)
+    else:
+        array = np.asarray(tensor.detach().cpu().numpy()).astype(TORCH_TO_NUMPY[tensor.dtype])
+    array.tofile(path)
 
 
 def export_one(out_dir, name, model, inputs, input_names, output_names, extra_manifest=None):
@@ -63,7 +80,7 @@ def export_one(out_dir, name, model, inputs, input_names, output_names, extra_ma
             {
                 "name": input_name,
                 "shape": list(tensor.shape),
-                "dtype": "f32",
+                "dtype": manifest_dtype(tensor),
                 "iree": shape_dtype_to_iree(tensor),
                 "file": repo_relative(path),
             }
@@ -75,7 +92,7 @@ def export_one(out_dir, name, model, inputs, input_names, output_names, extra_ma
             {
                 "name": output_name,
                 "shape": list(tensor.shape),
-                "dtype": "f32",
+                "dtype": manifest_dtype(tensor),
                 "iree": shape_dtype_to_iree(tensor),
                 "golden": repo_relative(path),
             }

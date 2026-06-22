@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,6 +20,7 @@ TRAIN_STEP_ARTIFACTS = THIS_DIR / "artifact_train"
 UPDATE_ARTIFACTS = THIS_DIR / "artifact_sgd"
 AUX_ARTIFACTS = THIS_DIR / "artifact_aux"
 FORWARD_ARTIFACTS = AUX_ARTIFACTS / "logits"
+FLEXI_SMOKE_ARTIFACTS = AUX_ARTIFACTS / "flexi_matmul"
 STAGE_ARTIFACTS = {
     "tta_views": AUX_ARTIFACTS / "tta_views",
     "logits": FORWARD_ARTIFACTS,
@@ -26,6 +28,7 @@ STAGE_ARTIFACTS = {
     "kip": AUX_ARTIFACTS / "kip",
     "sgd": UPDATE_ARTIFACTS,
     "train": TRAIN_STEP_ARTIFACTS,
+    "flexi_matmul": FLEXI_SMOKE_ARTIFACTS,
     "full": FULL_LOOP_ARTIFACTS,
 }
 
@@ -94,6 +97,10 @@ def prepare(args):
                 args.weights,
                 "--lr",
                 str(args.lr),
+                "--dtype",
+                args.dtype,
+                "--npu-dtype",
+                args.npu_dtype,
             ]
         )
     if args.force or not has_manifest(UPDATE_ARTIFACTS):
@@ -111,6 +118,8 @@ def prepare(args):
                 args.weights,
                 "--lr",
                 str(args.lr),
+                "--dtype",
+                args.dtype,
             ]
         )
     if args.force or not has_manifest(AUX_ARTIFACTS / "logits"):
@@ -130,6 +139,10 @@ def prepare(args):
                 str(args.ema_decay),
                 "--transform-seed",
                 str(args.transform_seed),
+                "--dtype",
+                args.dtype,
+                "--npu-dtype",
+                args.npu_dtype,
             ]
         )
     if args.force or not has_manifest(FULL_LOOP_ARTIFACTS):
@@ -156,6 +169,58 @@ def prepare(args):
             ]
         )
     print(FULL_LOOP_ARTIFACTS)
+
+
+def prepare_flexi_smoke(args):
+    out_dir = args.out_dir or (AUX_ARTIFACTS / f"flexi_{args.kind}_{args.dtype}")
+    run_cmd(
+        [
+            sys.executable,
+            script("export_flexi_smoke.py"),
+            "--out-dir",
+            str(out_dir),
+            "--kind",
+            args.kind,
+            "--dtype",
+            args.dtype,
+            *(["--out-dtype", args.out_dtype] if args.out_dtype else []),
+            "--seed",
+            str(args.seed),
+            "--m",
+            str(args.m),
+            "--n",
+            str(args.n),
+            "--k",
+            str(args.k),
+        ]
+    )
+    print(out_dir)
+
+
+def prepare_aux(args):
+    run_cmd(
+        [
+            sys.executable,
+            script("export_aux.py"),
+            "--out-dir",
+            str(args.out_dir),
+            "--image-size",
+            str(args.image_size),
+            "--classes",
+            str(args.classes),
+            "--weights",
+            args.weights,
+            "--dtype",
+            args.dtype,
+            "--npu-dtype",
+            args.npu_dtype,
+            "--ema-decay",
+            str(args.ema_decay),
+            "--transform-seed",
+            str(args.transform_seed),
+        ]
+    )
+    print(args.out_dir)
 
 
 def load_manifest(artifacts: Path = FULL_LOOP_ARTIFACTS) -> dict:
@@ -185,41 +250,163 @@ def compile_target(args):
 def summarize_outputs(output_dir: Path):
     import numpy as np
 
-    final_logits = np.fromfile(output_dir / "final_logits.bin", dtype=np.float32)
-    energy = np.fromfile(output_dir / "energy.bin", dtype=np.float32)
-    loss = np.fromfile(output_dir / "loss.bin", dtype=np.float32)
-    new_main = np.fromfile(output_dir / "new_main_bn_params.bin", dtype=np.float32)
-    new_ema = np.fromfile(output_dir / "new_ema_bn_params.bin", dtype=np.float32)
-    new_velocity = np.fromfile(output_dir / "new_sgd_velocity.bin", dtype=np.float32)
-    grad = np.fromfile(output_dir / "flat_bn_grads.bin", dtype=np.float32)
-    main = np.fromfile(TRAIN_STEP_ARTIFACTS / "inputs" / "flat_bn_params.bin", dtype=np.float32)
-    velocity = np.fromfile(FULL_LOOP_ARTIFACTS / "inputs" / "sgd_velocity.bin", dtype=np.float32)
-    lr = np.fromfile(FULL_LOOP_ARTIFACTS / "inputs" / "lr.bin", dtype=np.float32)[0]
-    sgd_momentum = np.fromfile(FULL_LOOP_ARTIFACTS / "inputs" / "sgd_momentum.bin", dtype=np.float32)[0]
-    ema_decay = np.fromfile(FULL_LOOP_ARTIFACTS / "inputs" / "ema_decay.bin", dtype=np.float32)[0]
+    arrays = {
+        "final_logits": np.fromfile(output_dir / "final_logits.bin", dtype=np.float32),
+        "energy": np.fromfile(output_dir / "energy.bin", dtype=np.float32),
+        "loss": np.fromfile(output_dir / "loss.bin", dtype=np.float32),
+        "new_main_bn_params": np.fromfile(output_dir / "new_main_bn_params.bin", dtype=np.float32),
+        "new_ema_bn_params": np.fromfile(output_dir / "new_ema_bn_params.bin", dtype=np.float32),
+        "new_sgd_velocity": np.fromfile(output_dir / "new_sgd_velocity.bin", dtype=np.float32),
+        "flat_bn_grads": np.fromfile(output_dir / "flat_bn_grads.bin", dtype=np.float32),
+    }
+    summarize_full_outputs(arrays, load_manifest())
+
+
+OUTPUT_RE = re.compile(
+    r"^\[IREE\]\[output\s+(\d+)\]\s+shape=.*\s+dtype=([A-Za-z0-9]+)\s+elements=(\d+)"
+)
+VALUE_RE = re.compile(r"^\s*\[\s*(\d+)\]\s+([-+a-zA-Z0-9.]+)\s*$")
+
+
+def parse_baremetal_outputs(text: str, manifest: dict) -> dict[str, "np.ndarray"]:
+    import numpy as np
+
+    values_by_index: dict[int, dict[int, float]] = {}
+    expected_counts: dict[int, int] = {}
+    current = None
+    for line in text.splitlines():
+        header = OUTPUT_RE.match(line)
+        if header:
+            current = int(header.group(1))
+            expected_counts[current] = int(header.group(3))
+            values_by_index[current] = {}
+            continue
+        match = VALUE_RE.match(line)
+        if match and current is not None:
+            raw_value = match.group(2).lower()
+            if raw_value in ("nan", "+nan", "-nan"):
+                value = float("nan")
+            elif raw_value in ("inf", "+inf"):
+                value = float("inf")
+            elif raw_value == "-inf":
+                value = float("-inf")
+            else:
+                value = float(raw_value)
+            values_by_index[current][int(match.group(1))] = value
+
+    parsed = {}
+    for index, item in enumerate(manifest["outputs"]):
+        if index not in values_by_index:
+            raise RuntimeError(f"missing baremetal output {index} ({item['name']})")
+        expected = expected_counts[index]
+        values = values_by_index[index]
+        if len(values) != expected:
+            raise RuntimeError(
+                f"output {index} ({item['name']}) printed {len(values)} values, "
+                f"expected {expected}. Rebuild the ELF with `--output-print-limit 0` "
+                "before using `--summary`."
+            )
+        parsed[item["name"]] = np.array([values[i] for i in range(expected)], dtype=np.float32)
+    return parsed
+
+
+def _stats(values):
+    import numpy as np
+
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {"min": None, "max": None, "mean": None, "l2": None}
+    return {
+        "min": float(finite.min()),
+        "max": float(finite.max()),
+        "mean": float(finite.mean()),
+        "l2": float(np.linalg.norm(finite)),
+    }
+
+
+def summarize_full_outputs(arrays: dict, manifest: dict):
+    import numpy as np
+
+    required = [
+        "final_logits",
+        "energy",
+        "loss",
+        "new_main_bn_params",
+        "new_ema_bn_params",
+        "new_sgd_velocity",
+        "flat_bn_grads",
+    ]
+    missing = [name for name in required if name not in arrays]
+    if missing:
+        raise RuntimeError(f"cannot summarize full output; missing {missing}")
+
+    final_logits = arrays["final_logits"].reshape(-1)
+    energy = arrays["energy"].reshape(-1)
+    loss = arrays["loss"].reshape(-1)
+    new_main = arrays["new_main_bn_params"].reshape(-1)
+    new_ema = arrays["new_ema_bn_params"].reshape(-1)
+    new_velocity = arrays["new_sgd_velocity"].reshape(-1)
+    grad = arrays["flat_bn_grads"].reshape(-1)
+    main = np.fromfile(repo_path("artifact_train/inputs/flat_bn_params.bin"), dtype=np.float32)
+    velocity = np.fromfile(repo_path("artifact_full/inputs/sgd_velocity.bin"), dtype=np.float32)
+    lr = float(np.fromfile(repo_path("artifact_full/inputs/lr.bin"), dtype=np.float32)[0])
+    sgd_momentum = float(np.fromfile(repo_path("artifact_full/inputs/sgd_momentum.bin"), dtype=np.float32)[0])
+    ema_decay = float(np.fromfile(repo_path("artifact_full/inputs/ema_decay.bin"), dtype=np.float32)[0])
+
+    top_count = min(5, final_logits.size)
+    top_indices = np.argsort(final_logits)[-top_count:][::-1]
+    main_delta = new_main - main
+    ema_delta = new_ema - main
+
     summary = {
-        "steps": load_manifest().get("steps", 1),
-        "final_pred": int(np.argmax(final_logits)),
-        "loss": float(loss.reshape(-1)[0]),
-        "energy": float(energy.reshape(-1)[0]),
-        "changed_main_bn_scalars": int(np.count_nonzero(new_main - main)),
-        "changed_ema_bn_scalars": int(np.count_nonzero(new_ema - main)),
+        "steps": int(manifest.get("steps", 1)),
+        "npu_dtype": manifest.get("npu_dtype", "f32"),
+        "prediction": {
+            "top1": int(top_indices[0]) if top_indices.size else None,
+            "top5": [
+                {"class": int(i), "logit": float(final_logits[i])}
+                for i in top_indices
+            ],
+            "energy_logsumexp": float(energy[0]) if energy.size else None,
+        },
+        "tta_objective": {
+            "loss": float(loss[0]) if loss.size else None,
+            "note": (
+                "PAFKIP uses loss_ind - alpha_ood * loss_ood, not cross entropy; "
+                "negative values are possible when the OOD entropy-maximization term dominates."
+            ),
+        },
+        "bn_training_state": {
+            "bn_scalars": int(main.size),
+            "changed_main_bn_scalars": int(np.count_nonzero(main_delta)),
+            "changed_ema_bn_scalars": int(np.count_nonzero(ema_delta)),
+            "main_delta": _stats(main_delta),
+            "ema_delta": _stats(ema_delta),
+            "grad": {
+                **_stats(grad),
+                "nonzero": int(np.count_nonzero(grad)),
+            },
+            "velocity": {
+                **_stats(new_velocity),
+                "nonzero": int(np.count_nonzero(new_velocity)),
+            },
+        },
     }
     if summary["steps"] == 1:
         expected_velocity = sgd_momentum * velocity + grad
-        summary.update(
-            {
-                "velocity_formula_max_abs": float(np.max(np.abs(new_velocity - expected_velocity))),
-                "main_update_formula_max_abs": float(np.max(np.abs(new_main - (main - lr * expected_velocity)))),
-                "ema_formula_max_abs": float(
-                    np.max(np.abs(new_ema - (ema_decay * main + (1.0 - ema_decay) * new_main)))
-                ),
-            }
-        )
+        expected_main = main - lr * expected_velocity
+        expected_ema = ema_decay * main + (1.0 - ema_decay) * expected_main
+        summary["update_formula_checks"] = {
+            "lr": lr,
+            "sgd_momentum": sgd_momentum,
+            "ema_decay": ema_decay,
+            "velocity_max_abs_error": float(np.max(np.abs(new_velocity - expected_velocity))),
+            "main_bn_update_max_abs_error": float(np.max(np.abs(new_main - expected_main))),
+            "ema_update_max_abs_error": float(np.max(np.abs(new_ema - expected_ema))),
+        }
     else:
-        summary["formula_check"] = (
-            "skipped: multi-step recurrence needs a full reference loop, "
-            "not the one-step closed-form check"
+        summary["update_formula_checks"] = (
+            "skipped: multi-step recurrence needs per-step reference states"
         )
     print(json.dumps(summary, indent=2))
 
@@ -298,6 +485,8 @@ def baremetal_build(args):
 
 
 def baremetal_run(args):
+    from iree_run import spike_extension_for_target
+
     artifacts = args.artifacts
     if not artifacts.is_absolute():
         artifacts = THIS_DIR / artifacts
@@ -321,9 +510,13 @@ def baremetal_run(args):
     isa = (
         "rv64gc_zicsr_zifencei_zicntr_zihpm"
         if manifest.get("riscv_features") == "scalar"
-        else "rv64gcv_zvl512b_zicsr_zifencei_zicntr_zihpm"
+        else "rv64gcv_zvl128b_zicsr_zifencei_zicntr_zihpm"
     )
-    cmd = [spike, "-m4096", f"--isa={isa}", str(elf)]
+    cmd = [spike]
+    extension = spike_extension_for_target(target, manifest)
+    if extension:
+        cmd.append(f"--extension={extension}")
+    cmd.extend(["-m4096", f"--isa={isa}", str(elf)])
     if args.timeout:
         cmd = ["timeout", str(args.timeout), *cmd]
     env = os.environ.copy()
@@ -338,6 +531,8 @@ def baremetal_run(args):
     result = run_capture(cmd, env=env, allow_timeout=bool(args.timeout))
     if not (args.timeout and result.returncode == 124):
         print(result.stdout)
+        if args.summary:
+            summarize_full_outputs(parse_baremetal_outputs(result.stdout, manifest), manifest)
 
 
 def forward_build(args):
@@ -415,6 +610,8 @@ def add_common_build_args(parser):
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--classes", type=int, default=1000)
     parser.add_argument("--weights", choices=["none", "default"], default="none")
+    parser.add_argument("--dtype", choices=["f32", "f16"], default="f32")
+    parser.add_argument("--npu-dtype", choices=["f32", "f16", "bf16"], default="f32")
     parser.add_argument("--force", action="store_true")
 
 
@@ -422,7 +619,7 @@ def add_baremetal_build_args(parser):
     parser.add_argument("--target", choices=["saturn", "flexinpu"], default="saturn")
     parser.add_argument("--runtime-root", type=Path)
     parser.add_argument("--toolchain-root", type=Path)
-    parser.add_argument("--march", default="rv64gcv_zvl512b")
+    parser.add_argument("--march", default="rv64gcv_zvl128b")
     parser.add_argument("--mabi", default="lp64d")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--output-print-limit", type=int, default=16)
@@ -440,6 +637,11 @@ def add_baremetal_run_args(parser):
     parser.add_argument("--elf", type=Path)
     parser.add_argument("--rebuild", action="store_true")
     parser.add_argument("--timeout", type=int, default=0, help="optional timeout seconds for Spike")
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="Parse full printed outputs and summarize the PAFKIP training update.",
+    )
 
 
 def build_parser():
@@ -451,6 +653,22 @@ def build_parser():
     p = sub.add_parser("prepare", help="export/compose the full all-BN EMA+KIP device loop")
     add_common_build_args(p)
     p.set_defaults(func=prepare)
+
+    p = sub.add_parser("prepare-flexi-smoke", help="export a small f32/f16/bf16 Flexi-NPU matmul or conv stage")
+    p.add_argument("--kind", choices=["matmul", "conv"], default="matmul")
+    p.add_argument("--dtype", choices=["f32", "f16", "bf16"], default="bf16")
+    p.add_argument("--out-dtype", choices=["f32", "f16", "bf16"])
+    p.add_argument("--seed", type=int, default=91)
+    p.add_argument("--m", type=int, default=32)
+    p.add_argument("--n", type=int, default=32)
+    p.add_argument("--k", type=int, default=32)
+    p.add_argument("--out-dir", type=Path)
+    p.set_defaults(func=prepare_flexi_smoke)
+
+    p = sub.add_parser("prepare-aux", help="export aux stages, optionally in f16 for Flexi-NPU bring-up")
+    p.add_argument("--out-dir", type=Path, default=AUX_ARTIFACTS)
+    add_common_build_args(p)
+    p.set_defaults(func=prepare_aux)
 
     p = sub.add_parser("compile", help="compile the full loop VMFB")
     p.add_argument("--target", choices=["host", "saturn", "flexinpu", "both"], default="host")

@@ -22,9 +22,9 @@ from model import (
 
 
 class FlatBNResNet50Logits(torch.nn.Module):
-    def __init__(self, classes=1000, weights_name="none"):
+    def __init__(self, classes=1000, weights_name="none", npu_dtype="f32"):
         super().__init__()
-        self.model = FlatBNResNet50PAFLoss(classes, weights_name)
+        self.model = FlatBNResNet50PAFLoss(classes, weights_name, npu_dtype)
 
     def forward(self, images, flat_bn_params):
         return self.model.forward_logits(images, flat_bn_params)
@@ -38,7 +38,8 @@ class FlatBNEMAUpdate(torch.nn.Module):
 class PAFKIPKIPFinal(torch.nn.Module):
     def forward(self, main_logits, ema_logits, anchor_logits):
         final_logits = kip(main_logits, ema_logits, anchor_logits)
-        energy = torch.log(torch.exp(main_logits).sum(dim=1))
+        main_f32 = main_logits.to(torch.float32)
+        energy = torch.log(torch.exp(main_f32).sum(dim=1)).to(main_logits.dtype)
         return final_logits, energy
 
 
@@ -52,22 +53,25 @@ def main():
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--classes", type=int, default=1000)
     parser.add_argument("--weights", choices=["none", "default"], default="none")
+    parser.add_argument("--dtype", choices=["f32", "f16"], default="f32")
+    parser.add_argument("--npu-dtype", choices=["f32", "f16", "bf16"], default="f32")
     parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--transform-seed", type=int, default=91)
     args = parser.parse_args()
 
+    dtype = torch.float16 if args.dtype == "f16" else torch.float32
     torch.manual_seed(91)
     ref_model, _, _ = make_resnet50_tta_models_with_weights(args.classes, args.weights)
     ref_params, _ = collect_bn_affine_params(ref_model)
-    flat_bn_params = flatten_bn_params(ref_params)
+    flat_bn_params = flatten_bn_params(ref_params).to(dtype)
     shifted_bn_params = flat_bn_params + torch.linspace(
-        0.0, 1.0e-3, flat_bn_params.numel(), dtype=torch.float32
+        0.0, 1.0e-3, flat_bn_params.numel(), dtype=dtype
     )
-    images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
-    logits = torch.randn(1, args.classes, dtype=torch.float32)
-    ema_logits = torch.randn(1, args.classes, dtype=torch.float32)
-    anchor_logits = torch.randn(1, args.classes, dtype=torch.float32)
-    ema_decay = torch.tensor(args.ema_decay, dtype=torch.float32)
+    images = torch.randn(1, 3, args.image_size, args.image_size, dtype=dtype)
+    logits = torch.randn(1, args.classes, dtype=dtype)
+    ema_logits = torch.randn(1, args.classes, dtype=dtype)
+    anchor_logits = torch.randn(1, args.classes, dtype=dtype)
+    ema_decay = torch.tensor(args.ema_decay, dtype=dtype)
 
     transform_outputs = export_one(
         args.out_dir / "tta_views",
@@ -89,11 +93,15 @@ def main():
     export_one(
         args.out_dir / "logits",
         "logits",
-        FlatBNResNet50Logits(args.classes, args.weights),
+        FlatBNResNet50Logits(args.classes, args.weights, args.npu_dtype).to(dtype),
         (images, flat_bn_params),
         ["images", "flat_bn_params"],
         ["logits"],
-        {"llvmcpu_vector_pproc_strategy": "none", "llvmcpu_stack_allocation_limit": 1048576},
+        {
+            "llvmcpu_vector_pproc_strategy": "none",
+            "llvmcpu_stack_allocation_limit": 1048576,
+            "npu_dtype": args.npu_dtype,
+        },
     )
     export_one(
         args.out_dir / "ema",

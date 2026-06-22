@@ -11,6 +11,12 @@ ROOT_DIR = THIS_DIR.parent
 from paths import repo_path, repo_relative
 
 
+DTYPE_TO_NP = {
+    "f32": np.float32,
+    "f16": np.float16,
+}
+
+
 def by_name(items: list[dict]) -> dict[str, dict]:
     result = {}
     for item in items:
@@ -22,12 +28,13 @@ def by_name(items: list[dict]) -> dict[str, dict]:
 
 
 def torch_vtensor(item: dict) -> str:
-    if item["dtype"] != "f32":
-        raise ValueError(f"{item['name']} must be f32, got {item['dtype']}")
+    dtype = item["dtype"]
+    if dtype not in DTYPE_TO_NP:
+        raise ValueError(f"{item['name']} has unsupported dtype: {dtype}")
     shape = item["shape"]
     if shape:
-        return "!torch.vtensor<[" + ",".join(str(dim) for dim in shape) + "],f32>"
-    return "!torch.vtensor<[],f32>"
+        return "!torch.vtensor<[" + ",".join(str(dim) for dim in shape) + f"],{dtype}>"
+    return f"!torch.vtensor<[],{dtype}>"
 
 
 def check_shape(item: dict, expected: list[int], label: str):
@@ -41,6 +48,15 @@ def check_same_shape(lhs: dict, rhs: dict, label: str):
         raise ValueError(
             f"{label} shape mismatch: {lhs['name']}={lhs['shape']} "
             f"{rhs['name']}={rhs['shape']}"
+        )
+
+
+def check_same_abi(lhs: dict, rhs: dict, label: str):
+    check_same_shape(lhs, rhs, label)
+    if lhs["dtype"] != rhs["dtype"]:
+        raise ValueError(
+            f"{label} dtype mismatch: {lhs['name']}={lhs['dtype']} "
+            f"{rhs['name']}={rhs['dtype']}"
         )
 
 
@@ -79,9 +95,9 @@ def load_body(manifest_path: Path, new_name: str) -> tuple[str, str, dict]:
     return rename_main(body, new_name), resources, manifest
 
 
-def write_scalar(path: Path, value: float):
+def write_scalar(path: Path, value: float, dtype: str):
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.asarray(np.array(value, dtype=np.float32)).tofile(path)
+    np.asarray(np.array(value, dtype=DTYPE_TO_NP[dtype])).tofile(path)
 
 
 def copy_bin(src: str, dst: Path):
@@ -89,10 +105,10 @@ def copy_bin(src: str, dst: Path):
     dst.write_bytes(repo_path(src).read_bytes())
 
 
-def write_zeros(path: Path, shape: list[int]):
+def write_zeros(path: Path, shape: list[int], dtype: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     count = int(np.prod(shape, dtype=np.int64)) if shape else 1
-    np.zeros(count, dtype=np.float32).tofile(path)
+    np.zeros(count, dtype=DTYPE_TO_NP[dtype]).tofile(path)
 
 
 def main():
@@ -225,27 +241,27 @@ def main():
     new_ema_item = ema_outputs["new_ema_bn_params"]
     bn_shape = main_item["shape"]
     logits_shape = logits_item["shape"]
-    check_same_shape(train_images_item, logits_inputs["images"], "train/logits image ABI")
-    check_same_shape(main_filter_images_item, logits_inputs["images"], "filter/logits image ABI")
-    check_same_shape(raw_images_item, train_images_item, "tta raw/train image ABI")
-    check_same_shape(tta_outputs["train_images"], train_images_item, "tta train image ABI")
-    check_same_shape(tta_outputs["main_filter_images"], main_filter_images_item, "tta main filter image ABI")
-    check_same_shape(tta_outputs["ema_filter_images"], logits_inputs["images"], "tta ema image ABI")
-    check_same_shape(tta_outputs["anchor_images"], logits_inputs["images"], "tta anchor image ABI")
-    check_same_shape(main_item, logits_inputs["flat_bn_params"], "train/logits BN ABI")
-    check_same_shape(main_item, update_inputs["bn_params"], "train/sgd BN ABI")
-    check_same_shape(grad_item, update_inputs["bn_grads"], "train/sgd grad ABI")
-    check_same_shape(main_item, update_inputs["velocity"], "train/sgd velocity ABI")
-    check_same_shape(main_item, update_outputs["new_bn_params"], "sgd output ABI")
-    check_same_shape(main_item, update_outputs["new_velocity"], "sgd velocity output ABI")
-    check_same_shape(main_item, ema_inputs["ema_bn_params"], "ema input ABI")
-    check_same_shape(main_item, ema_inputs["main_bn_params"], "ema input ABI")
-    check_same_shape(main_item, ema_outputs["new_ema_bn_params"], "ema output ABI")
-    check_same_shape(input_by_name["ema_filter_logits"], logits_item, "train/logits output ABI")
-    check_same_shape(logits_item, kip_inputs["main_logits"], "kip main logits ABI")
-    check_same_shape(logits_item, kip_inputs["ema_logits"], "kip ema logits ABI")
-    check_same_shape(logits_item, kip_inputs["anchor_logits"], "kip anchor logits ABI")
-    check_same_shape(logits_item, kip_outputs["final_logits"], "kip final logits ABI")
+    check_same_abi(train_images_item, logits_inputs["images"], "train/logits image ABI")
+    check_same_abi(main_filter_images_item, logits_inputs["images"], "filter/logits image ABI")
+    check_same_abi(raw_images_item, train_images_item, "tta raw/train image ABI")
+    check_same_abi(tta_outputs["train_images"], train_images_item, "tta train image ABI")
+    check_same_abi(tta_outputs["main_filter_images"], main_filter_images_item, "tta main filter image ABI")
+    check_same_abi(tta_outputs["ema_filter_images"], logits_inputs["images"], "tta ema image ABI")
+    check_same_abi(tta_outputs["anchor_images"], logits_inputs["images"], "tta anchor image ABI")
+    check_same_abi(main_item, logits_inputs["flat_bn_params"], "train/logits BN ABI")
+    check_same_abi(main_item, update_inputs["bn_params"], "train/sgd BN ABI")
+    check_same_abi(grad_item, update_inputs["bn_grads"], "train/sgd grad ABI")
+    check_same_abi(main_item, update_inputs["velocity"], "train/sgd velocity ABI")
+    check_same_abi(main_item, update_outputs["new_bn_params"], "sgd output ABI")
+    check_same_abi(main_item, update_outputs["new_velocity"], "sgd velocity output ABI")
+    check_same_abi(main_item, ema_inputs["ema_bn_params"], "ema input ABI")
+    check_same_abi(main_item, ema_inputs["main_bn_params"], "ema input ABI")
+    check_same_abi(main_item, ema_outputs["new_ema_bn_params"], "ema output ABI")
+    check_same_abi(input_by_name["ema_filter_logits"], logits_item, "train/logits output ABI")
+    check_same_abi(logits_item, kip_inputs["main_logits"], "kip main logits ABI")
+    check_same_abi(logits_item, kip_inputs["ema_logits"], "kip ema logits ABI")
+    check_same_abi(logits_item, kip_inputs["anchor_logits"], "kip anchor logits ABI")
+    check_same_abi(logits_item, kip_outputs["final_logits"], "kip final logits ABI")
     check_shape(loss_item, [], "train loss")
     check_shape(update_inputs["lr"], [], "sgd lr")
     check_shape(update_inputs["sgd_momentum"], [], "sgd momentum")
@@ -258,9 +274,16 @@ def main():
 
     image_type = torch_vtensor(train_images_item)
     bn_type = torch_vtensor(main_item)
+    grad_type = torch_vtensor(grad_item)
+    velocity_type = torch_vtensor(update_inputs["velocity"])
+    new_bn_type = torch_vtensor(new_main_item)
+    new_velocity_type = torch_vtensor(new_velocity_item)
     logits_type = torch_vtensor(logits_item)
-    scalar_type = torch_vtensor(loss_item)
+    loss_type = torch_vtensor(loss_item)
     energy_type = torch_vtensor(energy_item)
+    lr_type = torch_vtensor(update_inputs["lr"])
+    sgd_momentum_type = torch_vtensor(update_inputs["sgd_momentum"])
+    ema_decay_type = torch_vtensor(ema_inputs["ema_decay"])
     ema_path = input_dir / "ema_bn_params.bin"
     anchor_path = input_dir / "anchor_bn_params.bin"
     velocity_path = input_dir / "sgd_velocity.bin"
@@ -269,13 +292,16 @@ def main():
     ema_decay_path = input_dir / "ema_decay.bin"
     raw_image_paths = []
     if args.per_step_inputs:
-        raw = np.fromfile(repo_path(raw_images_item["file"]), dtype=np.float32).reshape(raw_images_item["shape"])
+        raw = np.fromfile(
+            repo_path(raw_images_item["file"]),
+            dtype=DTYPE_TO_NP[raw_images_item["dtype"]],
+        ).reshape(raw_images_item["shape"])
         for step in range(args.steps):
             path = input_dir / f"raw_images_{step}.bin"
             # Deterministic synthetic stream for stage validation. Real ImageNet-C
             # loaders can replace these files without changing the ABI.
-            shifted = np.roll(raw, shift=step, axis=3) + np.float32(step * 1.0e-3)
-            shifted.astype(np.float32).tofile(path)
+            shifted = np.roll(raw, shift=step, axis=3) + DTYPE_TO_NP[raw_images_item["dtype"]](step * 1.0e-3)
+            shifted.astype(DTYPE_TO_NP[raw_images_item["dtype"]]).tofile(path)
             raw_image_paths.append(path)
     else:
         raw_images_path = input_dir / "raw_images.bin"
@@ -283,10 +309,10 @@ def main():
         raw_image_paths.append(raw_images_path)
     copy_bin(main_item["file"], ema_path)
     copy_bin(main_item["file"], anchor_path)
-    write_zeros(velocity_path, bn_shape)
-    write_scalar(lr_path, args.lr)
-    write_scalar(sgd_momentum_path, args.sgd_momentum)
-    write_scalar(ema_decay_path, args.ema_decay)
+    write_zeros(velocity_path, bn_shape, update_inputs["velocity"]["dtype"])
+    write_scalar(lr_path, args.lr, update_inputs["lr"]["dtype"])
+    write_scalar(sgd_momentum_path, args.sgd_momentum, update_inputs["sgd_momentum"]["dtype"])
+    write_scalar(ema_decay_path, args.ema_decay, ema_inputs["ema_decay"]["dtype"])
 
     raw_arg_count = args.steps if args.per_step_inputs else 1
     main_arg = f"%arg{raw_arg_count}"
@@ -303,9 +329,9 @@ def main():
         f"{ema_arg}: {bn_type}",
         f"{anchor_arg}: {bn_type}",
         f"{velocity_arg}: {bn_type}",
-        f"{lr_arg}: {scalar_type}",
-        f"{sgd_momentum_arg}: {scalar_type}",
-        f"{ema_decay_arg}: {scalar_type}",
+        f"{lr_arg}: {lr_type}",
+        f"{sgd_momentum_arg}: {sgd_momentum_type}",
+        f"{ema_decay_arg}: {ema_decay_type}",
     ]
 
     raw_for_step0 = "%arg0"
@@ -314,10 +340,10 @@ def main():
         f"    %main_logits0 = func.call @logits(%views0#0, {main_arg}) : ({image_type}, {bn_type}) -> {logits_type}",
         f"    %ema_filter_logits0 = func.call @logits(%views0#2, {ema_arg}) : ({image_type}, {bn_type}) -> {logits_type}",
         f"    %anchor_logits0 = func.call @logits(%views0#3, {anchor_arg}) : ({image_type}, {bn_type}) -> {logits_type}",
-        f"    %train0:2 = func.call @paf_train_step(%views0#0, %views0#1, %ema_filter_logits0, {main_arg}) : ({image_type}, {image_type}, {logits_type}, {bn_type}) -> ({scalar_type}, {bn_type})",
+        f"    %train0:2 = func.call @paf_train_step(%views0#0, %views0#1, %ema_filter_logits0, {main_arg}) : ({image_type}, {image_type}, {logits_type}, {bn_type}) -> ({loss_type}, {grad_type})",
         f"    %final0:2 = func.call @kip(%main_logits0, %ema_filter_logits0, %anchor_logits0) : ({logits_type}, {logits_type}, {logits_type}) -> ({logits_type}, {energy_type})",
-        f"    %sgd0:2 = func.call @sgd({main_arg}, %train0#1, {velocity_arg}, {lr_arg}, {sgd_momentum_arg}) : ({bn_type}, {bn_type}, {bn_type}, {scalar_type}, {scalar_type}) -> ({bn_type}, {bn_type})",
-        f"    %ema1 = func.call @ema({ema_arg}, %sgd0#0, {ema_decay_arg}) : ({bn_type}, {bn_type}, {scalar_type}) -> {bn_type}",
+        f"    %sgd0:2 = func.call @sgd({main_arg}, %train0#1, {velocity_arg}, {lr_arg}, {sgd_momentum_arg}) : ({bn_type}, {grad_type}, {velocity_type}, {lr_type}, {sgd_momentum_type}) -> ({new_bn_type}, {new_velocity_type})",
+        f"    %ema1 = func.call @ema({ema_arg}, %sgd0#0, {ema_decay_arg}) : ({bn_type}, {new_bn_type}, {ema_decay_type}) -> {bn_type}",
     ]
     last_main = "%sgd0#0"
     last_ema = "%ema1"
@@ -336,10 +362,10 @@ def main():
                 f"    %main_logits{step} = func.call @logits(%views{step}#0, {last_main}) : ({image_type}, {bn_type}) -> {logits_type}",
                 f"    %ema_filter_logits{step} = func.call @logits(%views{step}#2, {last_ema}) : ({image_type}, {bn_type}) -> {logits_type}",
                 f"    %anchor_logits{step} = func.call @logits(%views{step}#3, {anchor_arg}) : ({image_type}, {bn_type}) -> {logits_type}",
-                f"    %train{step}:2 = func.call @paf_train_step(%views{step}#0, %views{step}#1, %ema_filter_logits{step}, {last_main}) : ({image_type}, {image_type}, {logits_type}, {bn_type}) -> ({scalar_type}, {bn_type})",
+                f"    %train{step}:2 = func.call @paf_train_step(%views{step}#0, %views{step}#1, %ema_filter_logits{step}, {last_main}) : ({image_type}, {image_type}, {logits_type}, {bn_type}) -> ({loss_type}, {grad_type})",
                 f"    %final{step}:2 = func.call @kip(%main_logits{step}, %ema_filter_logits{step}, %anchor_logits{step}) : ({logits_type}, {logits_type}, {logits_type}) -> ({logits_type}, {energy_type})",
-                f"    %sgd{step}:2 = func.call @sgd({last_main}, %train{step}#1, {last_velocity}, {lr_arg}, {sgd_momentum_arg}) : ({bn_type}, {bn_type}, {bn_type}, {scalar_type}, {scalar_type}) -> ({bn_type}, {bn_type})",
-                f"    %ema{step + 1} = func.call @ema({last_ema}, %sgd{step}#0, {ema_decay_arg}) : ({bn_type}, {bn_type}, {scalar_type}) -> {bn_type}",
+                f"    %sgd{step}:2 = func.call @sgd({last_main}, %train{step}#1, {last_velocity}, {lr_arg}, {sgd_momentum_arg}) : ({bn_type}, {grad_type}, {velocity_type}, {lr_type}, {sgd_momentum_type}) -> ({new_bn_type}, {new_velocity_type})",
+                f"    %ema{step + 1} = func.call @ema({last_ema}, %sgd{step}#0, {ema_decay_arg}) : ({bn_type}, {new_bn_type}, {ema_decay_type}) -> {bn_type}",
             ]
         )
         last_main = f"%sgd{step}#0"
@@ -351,9 +377,9 @@ def main():
         last_grad = f"%train{step}#1"
 
     loop_body = f"""
-  func.func @main({", ".join(function_args)}) -> ({logits_type}, {energy_type}, {scalar_type}, {bn_type}, {bn_type}, {bn_type}, {bn_type}) {{
+  func.func @main({", ".join(function_args)}) -> ({logits_type}, {energy_type}, {loss_type}, {bn_type}, {bn_type}, {new_velocity_type}, {grad_type}) {{
 {chr(10).join(step_lines)}
-    return {last_final}, {last_energy}, {last_loss}, {last_main}, {last_ema}, {last_velocity}, {last_grad} : {logits_type}, {energy_type}, {scalar_type}, {bn_type}, {bn_type}, {bn_type}, {bn_type}
+    return {last_final}, {last_energy}, {last_loss}, {last_main}, {last_ema}, {last_velocity}, {last_grad} : {logits_type}, {energy_type}, {loss_type}, {bn_type}, {bn_type}, {new_velocity_type}, {grad_type}
   }}
 """
     mlir_path = args.out_dir / "full.mlir"
@@ -399,63 +425,89 @@ def main():
             {
                 "name": "ema_bn_params",
                 "shape": bn_shape,
-                "dtype": "f32",
+                "dtype": ema_inputs["ema_bn_params"]["dtype"],
                 "iree": main_item["iree"],
                 "file": repo_relative(ema_path),
             },
             {
                 "name": "anchor_bn_params",
                 "shape": bn_shape,
-                "dtype": "f32",
+                "dtype": main_item["dtype"],
                 "iree": main_item["iree"],
                 "file": repo_relative(anchor_path),
             },
             {
                 "name": "sgd_velocity",
                 "shape": bn_shape,
-                "dtype": "f32",
-                "iree": main_item["iree"],
+                "dtype": update_inputs["velocity"]["dtype"],
+                "iree": update_inputs["velocity"]["iree"],
                 "file": repo_relative(velocity_path),
             },
-            {"name": "lr", "shape": [], "dtype": "f32", "iree": "f32", "file": repo_relative(lr_path)},
+            {
+                "name": "lr",
+                "shape": [],
+                "dtype": update_inputs["lr"]["dtype"],
+                "iree": update_inputs["lr"]["iree"],
+                "file": repo_relative(lr_path),
+            },
             {
                 "name": "sgd_momentum",
                 "shape": [],
-                "dtype": "f32",
-                "iree": "f32",
+                "dtype": update_inputs["sgd_momentum"]["dtype"],
+                "iree": update_inputs["sgd_momentum"]["iree"],
                 "file": repo_relative(sgd_momentum_path),
             },
             {
                 "name": "ema_decay",
                 "shape": [],
-                "dtype": "f32",
-                "iree": "f32",
+                "dtype": ema_inputs["ema_decay"]["dtype"],
+                "iree": ema_inputs["ema_decay"]["iree"],
                 "file": repo_relative(ema_decay_path),
             },
         ],
         "outputs": [
-            {"name": "final_logits", "shape": logits_shape, "dtype": "f32", "iree": final_item["iree"]},
-            {"name": "energy", "shape": energy_item["shape"], "dtype": "f32", "iree": energy_item["iree"]},
-            {"name": "loss", "shape": [], "dtype": "f32", "iree": "f32"},
+            {
+                "name": "final_logits",
+                "shape": logits_shape,
+                "dtype": final_item["dtype"],
+                "iree": final_item["iree"],
+            },
+            {
+                "name": "energy",
+                "shape": energy_item["shape"],
+                "dtype": energy_item["dtype"],
+                "iree": energy_item["iree"],
+            },
+            {
+                "name": "loss",
+                "shape": loss_item["shape"],
+                "dtype": loss_item["dtype"],
+                "iree": loss_item["iree"],
+            },
             {
                 "name": "new_main_bn_params",
                 "shape": new_main_item["shape"],
-                "dtype": "f32",
+                "dtype": new_main_item["dtype"],
                 "iree": new_main_item["iree"],
             },
             {
                 "name": "new_ema_bn_params",
                 "shape": new_ema_item["shape"],
-                "dtype": "f32",
+                "dtype": new_ema_item["dtype"],
                 "iree": new_ema_item["iree"],
             },
             {
                 "name": "new_sgd_velocity",
                 "shape": new_velocity_item["shape"],
-                "dtype": "f32",
+                "dtype": new_velocity_item["dtype"],
                 "iree": new_velocity_item["iree"],
             },
-            {"name": "flat_bn_grads", "shape": grad_item["shape"], "dtype": "f32", "iree": grad_item["iree"]},
+            {
+                "name": "flat_bn_grads",
+                "shape": grad_item["shape"],
+                "dtype": grad_item["dtype"],
+                "iree": grad_item["iree"],
+            },
         ],
         "steps": args.steps,
         "lr": args.lr,
@@ -467,6 +519,7 @@ def main():
         "transform_specs": tta_manifest.get("transform_specs"),
         "bn_param_count": train_manifest["bn_param_count"],
         "bn_scalar_count": train_manifest["bn_scalar_count"],
+        "npu_dtype": train_manifest.get("npu_dtype", logits_manifest.get("npu_dtype", "f32")),
         "llvmcpu_vector_pproc_strategy": "none",
         "llvmcpu_stack_allocation_limit": 1048576,
     }

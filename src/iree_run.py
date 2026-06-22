@@ -12,6 +12,31 @@ PACKAGE_DIR = THIS_DIR.parent
 from paths import repo_path
 
 
+DTYPE_TO_NUMPY = {
+    "f32": "float32",
+    "f16": "float16",
+    "i8": "int8",
+}
+
+
+def read_tensor(path: Path, dtype: str):
+    import numpy as np
+
+    if dtype not in DTYPE_TO_NUMPY:
+        raise ValueError(f"unsupported tensor dtype for comparison: {dtype}")
+    return np.fromfile(path, dtype=np.dtype(DTYPE_TO_NUMPY[dtype])).astype(np.float32)
+
+
+def read_actual_tensor(path: Path, item: dict):
+    return read_tensor(path, item.get("dtype", "f32"))
+
+
+def read_golden_tensor(path: Path, item: dict):
+    if item.get("compare_as") == "f32_reference":
+        return read_tensor(path, "f32")
+    return read_tensor(path, item.get("dtype", "f32"))
+
+
 def tool_from_path_or_root(tool_name: str, relative_path: str) -> str:
     submodule_candidate = PACKAGE_DIR / "third_party" / "iree" / "build" / "tools" / tool_name
     if submodule_candidate.exists():
@@ -79,19 +104,17 @@ def compile_module(manifest, out_dir: Path, target: str):
                 "--iree-llvmcpu-stack-allocation-limit="
                 + str(manifest["llvmcpu_stack_allocation_limit"])
             )
-    elif target in ("saturn", "flexinpu", "flexinpu_int4"):
+    elif target in ("saturn", "flexinpu"):
         scalar_riscv = manifest.get("riscv_features") == "scalar"
         riscv_features = (
             "+m,+f,+d,+a"
             if scalar_riscv
-            else "+m,+f,+d,+a,+v,+zvl512b"
+            else "+m,+f,+d,+a,+v,+zvl128b"
         )
-        if target in ("saturn", "flexinpu", "flexinpu_int4"):
+        if target in ("saturn", "flexinpu"):
             flags.append("--iree-global-opt-use-im2col-for-convs=true")
-        if target in ("flexinpu", "flexinpu_int4"):
+        if target == "flexinpu":
             riscv_features += ",+flexinpu"
-        if target == "flexinpu_int4" or manifest.get("flexinpu_npu_dtype") == "int4":
-            riscv_features += ",+flexinpu-int4"
         flags.extend(
             [
                 "--iree-llvmcpu-target-triple=riscv64-unknown-eabi-elf",
@@ -106,7 +129,7 @@ def compile_module(manifest, out_dir: Path, target: str):
             ]
         )
         if not scalar_riscv:
-            flags.append("--riscv-v-register-bit-width-lmul=4")
+            flags.append("--riscv-v-register-bit-width-lmul=1")
         if manifest.get("llvmcpu_vector_pproc_strategy"):
             flags.append(
                 "--iree-llvmcpu-vector-pproc-strategy="
@@ -124,7 +147,7 @@ def compile_module(manifest, out_dir: Path, target: str):
 
 
 def spike_extension_for_target(target: str, manifest: dict | None = None) -> str | None:
-    if target in ("flexinpu", "flexinpu_int4"):
+    if target == "flexinpu":
         return "flexi"
     if manifest and manifest.get("spike_extension"):
         return manifest["spike_extension"]
@@ -159,11 +182,11 @@ def compare_outputs(manifest, actual_paths, label: str):
 
     ok = True
     for item, actual_path in zip(manifest["outputs"], actual_paths):
-        golden = np.fromfile(repo_path(item["golden"]), dtype=np.float32)
-        if item.get("dtype") == "f32":
-            actual = np.fromfile(actual_path, dtype=np.float32)
-        else:
-            actual = np.fromfile(actual_path, dtype=np.int8).astype(np.float32)
+        if "golden" not in item:
+            print(f"{label}:{item['name']} skipped: no golden")
+            continue
+        golden = read_golden_tensor(repo_path(item["golden"]), item)
+        actual = read_actual_tensor(actual_path, item)
         if golden.shape != actual.shape:
             print(f"{label}:{item['name']} shape mismatch {actual.shape} != {golden.shape}")
             ok = False
@@ -186,7 +209,7 @@ def compare_outputs(manifest, actual_paths, label: str):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifacts", type=Path, default=THIS_DIR / "artifacts")
-    parser.add_argument("--target", choices=["host", "saturn", "flexinpu", "flexinpu_int4", "both"], default="both")
+    parser.add_argument("--target", choices=["host", "saturn", "flexinpu", "both"], default="both")
     parser.add_argument("--skip-run", action="store_true")
     args = parser.parse_args()
 
@@ -199,9 +222,7 @@ def main():
         compile_module(manifest, args.artifacts, "saturn")
     if args.target == "flexinpu":
         compile_module(manifest, args.artifacts, "flexinpu")
-    if args.target == "flexinpu_int4":
-        compile_module(manifest, args.artifacts, "flexinpu_int4")
-    if args.target in ("saturn", "flexinpu", "flexinpu_int4", "both") and not args.skip_run:
+    if args.target in ("saturn", "flexinpu", "both") and not args.skip_run:
         raise RuntimeError(
             "RISC-V execution is baremetal-only now; use "
             "`python3 run.py baremetal ...` or `python3 run.py forward-run`."

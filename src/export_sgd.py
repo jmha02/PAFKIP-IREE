@@ -29,24 +29,28 @@ def main():
     parser.add_argument("--weights", choices=["none", "default"], default="none")
     parser.add_argument("--lr", type=float, default=1.0e-3)
     parser.add_argument("--sgd-momentum", type=float, default=0.9)
+    parser.add_argument("--dtype", choices=["f32", "f16"], default="f32")
     args = parser.parse_args()
 
     torch.manual_seed(117)
+    dtype = torch.float16 if args.dtype == "f16" else torch.float32
     main_model, ema_model, _ = make_resnet50_tta_models_with_weights(args.classes, args.weights)
+    main_model = main_model.to(dtype)
+    ema_model = ema_model.to(dtype)
     params, names = collect_bn_affine_params(main_model)
-    train_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
-    main_filter_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=torch.float32)
+    train_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=dtype)
+    main_filter_images = torch.randn(1, 3, args.image_size, args.image_size, dtype=dtype)
     with torch.no_grad():
         ema_filter_logits = ema_model(main_filter_images)
         main_filter_logits = main_model(main_filter_images)
     train_logits = main_model(train_images)
     loss = paf_loss(train_logits, main_filter_logits, ema_filter_logits)
     loss.backward()
-    bn_params = flatten_bn_params(params)
-    bn_grads = flatten_bn_grads(params)
+    bn_params = flatten_bn_params(params).to(dtype)
+    bn_grads = flatten_bn_grads(params).to(dtype)
     velocity = torch.zeros_like(bn_params)
-    lr = torch.tensor(args.lr, dtype=torch.float32)
-    sgd_momentum = torch.tensor(args.sgd_momentum, dtype=torch.float32)
+    lr = torch.tensor(args.lr, dtype=dtype)
+    sgd_momentum = torch.tensor(args.sgd_momentum, dtype=dtype)
 
     outputs = export_one(
         args.out_dir,

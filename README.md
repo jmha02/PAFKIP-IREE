@@ -125,13 +125,19 @@ Expected output includes a JSON summary similar to:
 
 ```text
 "steps": 1
-"loss": -13.461...
-"energy": 7.079...
-"changed_main_bn_scalars": ...
-"velocity_formula_max_abs": 0.0
-"main_update_formula_max_abs": 0.0
-"ema_formula_max_abs": 0.0
+"prediction": {"top1": ...}
+"tta_objective": {"loss": -13.46...}
+"bn_training_state": {"changed_main_bn_scalars": ...}
+"update_formula_checks": {
+  "velocity_max_abs_error": 0.0,
+  "main_bn_update_max_abs_error": 0.0,
+  "ema_update_max_abs_error": 0.0
+}
 ```
+
+The loss is the PAFKIP adaptation objective, not cross entropy:
+`loss_ind - alpha_ood * loss_ood`. It can be negative when the OOD
+entropy-maximization term is larger than the ID entropy-minimization term.
 
 Compile the composed loop for RISC-V/Saturn:
 
@@ -166,7 +172,7 @@ Or call Spike directly:
 
 ```bash
 spike -m4096 \
-  --isa=rv64gcv_zvl512b_zicsr_zifencei_zicntr_zihpm \
+  --isa=rv64gcv_zvl128b_zicsr_zifencei_zicntr_zihpm \
   artifact_full/full_baremetal_saturn_print1_stack30.elf
 ```
 
@@ -181,6 +187,85 @@ Simulation complete.
 ```
 
 This is the full baremetal path. It can take much longer than the small stage checks.
+
+For a training-oriented summary from the ELF output, build a full-print ELF and
+ask `run.py` to parse the printed tensors:
+
+```bash
+python3 run.py baremetal build \
+  --target saturn \
+  --artifacts artifact_full \
+  --reuse-vmfb \
+  --stack-shift 30 \
+  --output artifact_full/full_baremetal_saturn_fullprint_stack30.elf \
+  --output-print-limit 0
+
+python3 run.py baremetal run \
+  --target saturn \
+  --artifacts artifact_full \
+  --elf artifact_full/full_baremetal_saturn_fullprint_stack30.elf \
+  --summary
+```
+
+The summary reports top-5 logits, energy, the PAFKIP objective, how many BN
+scalars changed, gradient/velocity norms, and exact one-step checks for SGD
+momentum and EMA.
+
+## Mixed FP16 FlexiNPU Path
+
+There is also an experimental FlexiNPU path. It keeps the PAFKIP state in
+FP32, but casts only ResNet50 Conv/FC islands to FP16 so the heavy matmul
+dispatches can lower to FlexiNPU. BN, loss, SGD momentum, EMA, and KIP stay
+FP32.
+
+Generate a mixed artifact:
+
+```bash
+python3 run.py prepare --force --dtype f32 --npu-dtype f16
+```
+
+Compile it for FlexiNPU:
+
+```bash
+python3 run.py compile --target flexinpu
+```
+
+Build a baremetal ELF:
+
+```bash
+python3 run.py baremetal build \
+  --target flexinpu \
+  --artifacts artifact_full \
+  --reuse-vmfb \
+  --stack-shift 30 \
+  --output artifact_full/full_baremetal_flexinpu_print1_stack30.elf \
+  --output-print-limit 1
+```
+
+Run it on the TDS Spike extension:
+
+```bash
+spike --extension=flexi -m4096 \
+  --isa=rv64gcv_zvl128b_zicsr_zifencei_zicntr_zihpm \
+  artifact_full/full_baremetal_flexinpu_print1_stack30.elf
+```
+
+The full 224x224 ResNet50 TTA step is very slow in the current TDS FlexiNPU
+behavioral simulator. For a smaller smoke, use 65x65 while keeping the same
+ResNet50 BN update surface:
+
+```bash
+python3 run.py prepare --force --image-size 65 --dtype f32 --npu-dtype f16
+python3 run.py run --target host
+python3 run.py compile --target flexinpu
+```
+
+To check whether Conv/FC lowered to FlexiNPU, inspect the dumped assembly:
+
+```bash
+grep -R "f16xf16xf32" artifact_full/flexinpu_intms | head
+grep -R "\\.insn r 123" artifact_full/flexinpu_intms | head
+```
 
 ## FireSim Run
 
@@ -224,14 +309,14 @@ The full train run we tested completed successfully on FireSim in about
 The generated ELF assumes:
 
 - the core starts in M-mode at `0x80000000`
-- the simulator supports `rv64gcv_zvl512b_zicsr_zifencei_zicntr_zihpm`
+- the simulator supports `rv64gcv_zvl128b_zicsr_zifencei_zicntr_zihpm`
 - stdout and exit are handled through the HTIF `tohost/fromhost` protocol
 - enough DRAM is mapped above `0x80000000`
 
 The command used by `run.py baremetal run` is:
 
 ```bash
-spike -m4096 --isa=rv64gcv_zvl512b_zicsr_zifencei_zicntr_zihpm <elf>
+spike -m4096 --isa=rv64gcv_zvl128b_zicsr_zifencei_zicntr_zihpm <elf>
 ```
 
 This was tested with `TDS-Simulator-Spike-Extension`. In that Spike build,
