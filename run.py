@@ -265,7 +265,7 @@ def summarize_outputs(output_dir: Path):
 
 
 OUTPUT_RE = re.compile(
-    r"^\[IREE\]\[output\s+(\d+)\]\s+shape=.*\s+dtype=([A-Za-z0-9]+)\s+elements=(\d+)"
+    r"^\[IREE\]\[output\s+(\d+)(?:\s+[^\]]+)?\]\s+shape=.*\s+dtype=([A-Za-z0-9]+)\s+elements=(\d+)"
 )
 VALUE_RE = re.compile(r"^\s*\[\s*(\d+)\]\s+([-+a-zA-Z0-9.]+)\s*$")
 

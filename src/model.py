@@ -29,8 +29,14 @@ def collect_bn_affine_params(model):
     return params, names
 
 
+def sanitize_finite(values, limit=10000.0):
+    safe = torch.where(values == values, values, torch.zeros_like(values))
+    return torch.clamp(safe, min=-limit, max=limit)
+
+
 def entropy(logits):
-    p = torch.softmax(logits.to(torch.float32), dim=1).clamp(min=1.0e-6)
+    logits_f32 = sanitize_finite(logits.to(torch.float32), 80.0)
+    p = torch.softmax(logits_f32, dim=1).clamp(min=1.0e-6)
     return -(p * torch.log(p)).sum(dim=1)
 
 
@@ -54,9 +60,9 @@ def paf_loss(train_logits, main_filter_logits, ema_filter_logits, ent_thr_ratio=
 
 def kip(main_logits, ema_logits, anchor_logits, kip_alpha=0.1):
     output_dtype = main_logits.dtype
-    main_f32 = main_logits.to(torch.float32)
-    ema_f32 = ema_logits.to(torch.float32)
-    anchor_f32 = anchor_logits.to(torch.float32)
+    main_f32 = sanitize_finite(main_logits.to(torch.float32), 80.0)
+    ema_f32 = sanitize_finite(ema_logits.to(torch.float32), 80.0)
+    anchor_f32 = sanitize_finite(anchor_logits.to(torch.float32), 80.0)
     conf_main = torch.softmax(main_f32, dim=1).max(dim=1).values
     conf_ema = torch.softmax(ema_f32, dim=1).max(dim=1).values
     conf_anchor = torch.softmax(anchor_f32, dim=1).max(dim=1).values
@@ -69,6 +75,14 @@ def kip(main_logits, ema_logits, anchor_logits, kip_alpha=0.1):
         + w_ema[:, None] * ema_f32
         + w_anchor[:, None] * anchor_f32
     ).to(output_dtype)
+
+
+def stable_energy(logits):
+    logits_f32 = sanitize_finite(logits.to(torch.float32), 80.0)
+    max_logits = torch.max(logits_f32, dim=1, keepdim=True).values
+    shifted = logits_f32 - max_logits
+    energy = max_logits.squeeze(1) + torch.log(torch.exp(shifted).sum(dim=1))
+    return energy.to(logits.dtype)
 
 
 def seeded_pafkip_transform_specs(seed: int):
@@ -303,8 +317,12 @@ class AllBNSGDMomentumUpdate(torch.nn.Module):
     """Flat SGD+momentum update for every ResNet50 BatchNorm affine tensor."""
 
     def forward(self, bn_params, bn_grads, velocity, lr, sgd_momentum):
-        new_velocity = sgd_momentum * velocity + bn_grads
-        return bn_params - lr * new_velocity, new_velocity
+        safe_params = sanitize_finite(bn_params)
+        safe_grads = sanitize_finite(bn_grads)
+        safe_velocity = sanitize_finite(velocity)
+        new_velocity = sanitize_finite(sgd_momentum * safe_velocity + safe_grads)
+        new_bn_params = sanitize_finite(safe_params - lr * new_velocity)
+        return new_bn_params, new_velocity
 
 
 def flatten_bn_params(params):

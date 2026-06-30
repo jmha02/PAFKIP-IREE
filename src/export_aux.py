@@ -17,7 +17,9 @@ from model import (
     flatten_bn_params,
     kip,
     make_resnet50_tta_models_with_weights,
+    sanitize_finite,
     seeded_pafkip_transform_specs,
+    stable_energy,
 )
 
 
@@ -32,14 +34,15 @@ class FlatBNResNet50Logits(torch.nn.Module):
 
 class FlatBNEMAUpdate(torch.nn.Module):
     def forward(self, ema_bn_params, main_bn_params, ema_decay):
-        return ema_decay * ema_bn_params + (1.0 - ema_decay) * main_bn_params
+        safe_ema = sanitize_finite(ema_bn_params)
+        safe_main = sanitize_finite(main_bn_params)
+        return sanitize_finite(ema_decay * safe_ema + (1.0 - ema_decay) * safe_main)
 
 
 class PAFKIPKIPFinal(torch.nn.Module):
     def forward(self, main_logits, ema_logits, anchor_logits):
         final_logits = kip(main_logits, ema_logits, anchor_logits)
-        main_f32 = main_logits.to(torch.float32)
-        energy = torch.log(torch.exp(main_f32).sum(dim=1)).to(main_logits.dtype)
+        energy = stable_energy(main_logits)
         return final_logits, energy
 
 

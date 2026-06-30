@@ -79,12 +79,19 @@ def write_matmul_mlir(
 
 
 def export_matmul(
-    out_dir: Path, dtype: str, out_dtype: str, seed: int, m: int, n: int, k: int
+    out_dir: Path,
+    dtype: str,
+    out_dtype: str,
+    seed: int,
+    m: int,
+    n: int,
+    k: int,
+    init_value: float,
 ) -> None:
     rng = np.random.default_rng(seed)
     a = rng.standard_normal((m, k), dtype=np.float32) * 0.25
     b = rng.standard_normal((k, n), dtype=np.float32) * 0.25
-    c = np.zeros((m, n), dtype=np.float32)
+    c = np.full((m, n), init_value, dtype=np.float32)
     golden = a @ b + c
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -228,6 +235,7 @@ def main() -> None:
     parser.add_argument("--m", type=int, default=32)
     parser.add_argument("--n", type=int, default=32)
     parser.add_argument("--k", type=int, default=32)
+    parser.add_argument("--init-value", type=float, default=0.0)
     args = parser.parse_args()
     if args.kind == "matmul":
         export_matmul(
@@ -238,6 +246,7 @@ def main() -> None:
             args.m,
             args.n,
             args.k,
+            args.init_value,
         )
     else:
         export_conv(args.out_dir, args.dtype, args.out_dtype or args.dtype, args.seed)
